@@ -31,6 +31,73 @@ let mode = CFG.inputMode === 'window' ? 'window' : 'hot'
 let lastKey = ''
 let rectTimer = null
 
+// ---------------------------------------------------------------------------
+// 统一的 opacity 滞后判定（elVisible 与 popupVisible 共用，绝不能各写一套）
+// ---------------------------------------------------------------------------
+// ⚠️ opacity 的判定必须**滞后（latch）**，不能每次读数直接比较阈值。
+//    .dshwv-menu 是 `opacity:0 + transition:opacity .22s` 显隐的，面板刚点开时
+//    opacity 会从 0 一路爬到 1，中途必然穿过任何阈值。若直接拿阈值比较：
+//      · 阈值 0.9 → 面板已"看起来开着"的前 0.2s 被误判为关 → 上报小矩形
+//      · 阈值 0.05 → 关闭动画期间又误判为开 → 上报大矩形
+//    两个方向都会让「上报的矩形」抖动 → 鼠标移动时高频触发 → 肉眼看到的闪动。
+//    所以维护一张 WeakMap：
+//      关→开：opacity 一旦 >= OP_ON(0.5) 就立刻记成开（宁可早，点击不丢）
+//      开→关：必须连续 LATCH_STRIKES_NEEDED 次读到 opacity <= OP_OFF(0.1) 才记成关
+//    中间地带维持上次判定、不翻转 —— 这是消抖的关键。
+const OP_ON = 0.5
+const OP_OFF = 0.1
+const LATCH_STRIKES_NEEDED = 3
+const opLatch = new WeakMap()   // el -> { on:boolean, low:number }
+
+function opacityAllows(el, cs) {
+  if (!cs || cs.opacity === '' || cs.opacity === undefined) return true
+  const op = Number(cs.opacity)
+  if (!Number.isFinite(op)) return true
+  const st = opLatch.get(el) || { on: false, low: 0 }
+  if (op <= OP_OFF) {
+    st.low++
+    // 连续多次都低才是真的关了；只有一次低（过渡首帧/父级动画）不算
+    if (st.on && st.low < LATCH_STRIKES_NEEDED) { opLatch.set(el, st); return st.on }
+    st.on = false
+    opLatch.set(el, st)
+    return false
+  }
+  if (op >= OP_ON) {
+    st.on = true
+    st.low = 0
+    opLatch.set(el, st)
+    return true
+  }
+  // 中间地带（0.1 ~ 0.5）：维持上一次判定，不翻转 —— 这是消抖的关键
+  opLatch.set(el, st)
+  return st.on
+}
+
+// ⚠️ elVisible 与 popupVisible 必须**共用同一套可见性判据**，否则会出现这种撕裂：
+//   interactiveRect() 认为「菜单可见」把它算进并集 → 上报菜单大小的矩形；
+//   而 hasOpenPopup() 认为「菜单不可见」→ expanded 保持 false → reportRect 不让路。
+//   结果就是「上报的矩形自己在 菜单大小 ↔ 鲸鱼大小 之间来回跳」——
+//   鼠标移动时高频触发，就是用户看到的「移动时快速闪动、静止后不动」。
+//
+//   所以本函数只做**几何 + 硬性不可见**判断（display / visibility / pointer-events），
+//   **不再自己判 opacity 阈值**；opacity 交给统一的 opacityAllows() 处理。
+//   （历史上这里是 opacity<0.05，而 popupVisible 是 latch 的 0.5 —— 两边不一致就是 bug 源头。）
+//
+// ⚠️⚠️ 还有一类**鼠标驱动的抖源**必须挡掉：`.dshwv-menu-btn`。
+//   它的 CSS 是 `opacity:0; transition:opacity .15s` + `.dshwv-menu-btn-visible{opacity:1}`，
+//   而挂件里有一行 `menuBtn.classList.toggle('dshwv-menu-btn-visible', over || menuOpen || ...)`
+//   —— `over` 就是「鼠标是否悬停在鲸鱼上」。于是：
+//     鼠标一动 → over 翻转 → menuBtn 的 opacity 在 0↔1 之间反复 → 它进出可见集合
+//     → 上报的矩形宽高跟着跳 → 热点窗 setBounds 抖动 → 肉眼看到快速闪动。
+//     鼠标停住 → over 稳定 → 不跳了。**这与你描述的「移动时闪动、静止后不动」完全吻合。**
+//   这个按钮的位置在鲸鱼包围盒**内部**，把它算进并集对可用性毫无增益（包围盒已经覆盖它），
+//   所以直接把「hover 驱动显隐的小装饰件」整类排除，而不是去猜它的 opacity。
+const HOVER_DECOR_SEL = '.dshwv-menu-btn'
+
+function isHoverDecor(el) {
+  try { return !!el.closest(HOVER_DECOR_SEL) } catch (err) { return false }
+}
+
 function elVisible(el) {
   // 先做便宜的空间判断，再读计算样式（挂件 DOM 不大，但别每帧都全量 getComputedStyle）
   let r
@@ -41,9 +108,22 @@ function elVisible(el) {
   let cs
   try { cs = getComputedStyle(el) } catch (err) { return null }
   if (!cs) return r
-  if (cs.pointerEvents === 'none' || cs.display === 'none' || cs.visibility === 'hidden') return null
-  if (Number(cs.opacity || 1) < 0.05) return null
+  if (cs.display === 'none' || cs.visibility === 'hidden') return null
+  if (cs.pointerEvents === 'none') return null
+  return r
+}
+
+// 统一入口：元素是否为「鲸鱼本体」上可交互的部件（用于 root 子树扫描）。
+// 保留 pointer-events 严格要求（只有 auto/all 才接事件），并复用同一套 opacity 判据。
+function elInteractive(el) {
+  if (isHoverDecor(el)) return null
+  const r = elVisible(el)
+  if (!r) return null
+  let cs = null
+  try { cs = getComputedStyle(el) } catch (err) { return r }
+  if (!cs) return r
   if (cs.pointerEvents !== 'auto' && cs.pointerEvents !== 'all') return null
+  if (!opacityAllows(el, cs)) return null
   return r
 }
 
@@ -80,45 +160,6 @@ const OVERLAY_CLASSES = OVERLAY_SEL.split(',').map((s) => s.trim().slice(1))
 
 // 只认「自己」的 display，不看祖先 —— 否则面板套在 root 里时会被 root 的状态干扰。
 // 祖先链上有 display:none 的话 getComputedStyle 自己也会是 none，无需额外判断。
-//
-// ⚠️ opacity 的判定必须**滞后（latch）**，不能每次读数直接比较阈值。
-//    .dshwv-menu 是 `opacity:0 + transition:opacity .22s` 显隐的，面板刚点开时
-//    opacity 会从 0 一路爬到 1，中途必然穿过任何阈值。若直接拿阈值比较：
-//      · 阈值 0.9 → 面板已"看起来开着"的前 0.2s 被误判为关 → 上报小矩形 → 缩窗
-//      · 阈值 0.05 → 关闭动画期间又误判为开 → 上报大矩形 → 扩窗
-//    两个方向都会造成「扩/缩来回切」。所以维护一张 WeakMap：
-//      关→开：opacity 一旦 >= OP_ON(0.5) 就立刻记成开（宁可早，点击不丢）
-//      开→关：必须连续 latchStrikes 次读到 opacity <= OP_OFF(0.1) 才记成关
-//    （配合外层 syncExpand 的三重收窗防抖，双保险。）
-const OP_ON = 0.5
-const OP_OFF = 0.1
-const LATCH_STRIKES_NEEDED = 3
-const opLatch = new WeakMap()   // el -> { on:boolean, low:number }
-
-function opacityAllows(el, cs) {
-  if (!cs || cs.opacity === '' || cs.opacity === undefined) return true
-  const op = Number(cs.opacity)
-  if (!Number.isFinite(op)) return true
-  const st = opLatch.get(el) || { on: false, low: 0 }
-  if (op <= OP_OFF) {
-    st.low++
-    // 连续多次都低才是真的关了；只有一次低（过渡首帧/父级动画）不算
-    if (st.on && st.low < LATCH_STRIKES_NEEDED) { opLatch.set(el, st); return st.on }
-    st.on = false
-    opLatch.set(el, st)
-    return false
-  }
-  if (op >= OP_ON) {
-    st.on = true
-    st.low = 0
-    opLatch.set(el, st)
-    return true
-  }
-  // 中间地带（0.1 ~ 0.5）：维持上一次判定，不翻转 —— 这是消抖的关键
-  opLatch.set(el, st)
-  return st.on
-}
-
 function popupVisible(el) {
   if (!el || !el.isConnected) return false
   let cs = null
@@ -139,6 +180,50 @@ function popupVisible(el) {
   return true
 }
 
+// ⚠️⚠️⚠️ 最关键的抖源（实测日志抓到）：`.dshwv-root` 自身带 CSS 过渡
+//     .dshwv-root{ ... transition:left .16s ease,top .16s ease,transform .3s ease }
+//   而挂件在 hover / 重排 / 吸附时会改 `root.style.left/top`。
+//   **`getBoundingClientRect()` 在过渡进行中返回的是「正在移动的插值位置」**，
+//   所以只要拿 root 的 rect 去算并集，热点窗就会跟着一个 160~300ms 的移动目标跑。
+//   实测日志（鼠标在鲸鱼上移动时）：
+//     176,154 → 177,144 → 178,138 → 176,154   ← y 866→876→882→866，height 154→144→138→154
+//   三点一个来回、鼠标停住就停 —— 与用户描述完全一致。
+//
+//   解法：root 的落点盒 = **内联 style.left/top（过渡目标值，稳定）+ offsetWidth/Height（布局值）**。
+//   ⚠️ 绝不能叠加 transform / 不能读 rendered rect —— 那正是动画中间态。
+//
+//   ⚠️ 也**不要**去扫 root 子树：子树元素全是会动的装饰（呼吸、悬浮、菜单按钮），
+//      而且它们的 offsetLeft/offsetTop 是相对 offsetParent 的，混进视口坐标系会算歪
+//      （实测扫子树会把并集炸到 1607×919 ≈ 整个视口）。
+//      root 本身就是一个覆盖鲸鱼全体的方形，它的落点盒已经足够。
+function rootBox(root) {
+  if (!root) return null
+  const w = root.offsetWidth || root.clientWidth
+  const h = root.offsetHeight || root.clientHeight
+  if (!w || !h) return null
+  // 位置：内联 style 优先（挂件就是用它定位的，且这是过渡的目标值，不抖）
+  let left = NaN
+  let top = NaN
+  try {
+    const sl = root.style && root.style.left
+    const st = root.style && root.style.top
+    if (sl && sl !== 'auto') left = parseFloat(sl)
+    if (st && st !== 'auto') top = parseFloat(st)
+  } catch (err) {}
+  // 退化：直接读渲染矩形（会含动画中间态，但只在拿不到 inline style 时发生）
+  if (!Number.isFinite(left) || !Number.isFinite(top)) {
+    try {
+      const b = root.getBoundingClientRect()
+      left = b.left
+      top = b.top
+    } catch (err) { return null }
+  }
+  if (!Number.isFinite(left) || !Number.isFinite(top)) return null
+  const r = { left, top, right: left + w, bottom: top + h, width: w, height: h }
+  if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) return null
+  return r
+}
+
 function interactiveRect() {
   let root = null
   try { root = document.querySelector('.dshwv-root') } catch (err) { root = null }
@@ -152,14 +237,8 @@ function interactiveRect() {
     if (r.bottom > y2) y2 = r.bottom
   }
 
-  // ① 挂件本体（root 子树）：与原来一致
-  if (root) {
-    add(elVisible(root))
-    let nodes = []
-    try { nodes = root.querySelectorAll('*') } catch (err) { nodes = [] }
-    const cap = Math.min(nodes.length, 600)
-    for (let i = 0; i < cap; i++) add(elVisible(nodes[i]))
-  }
+  // ① 挂件本体：只取 root 的**落点盒**（稳定、不抖），不扫子树（见上方说明）
+  add(rootBox(root))
 
   // ② 弹出层（body 下的 fixed 面板/遮罩）：这是「选项点不动」的根因所在
   let pops = []
@@ -175,7 +254,7 @@ function interactiveRect() {
     let kids = []
     try { kids = el.querySelectorAll('*') } catch (err) { kids = [] }
     const kcap = Math.min(kids.length, 400)
-    for (let k = 0; k < kcap; k++) add(elVisible(kids[k]))
+    for (let k = 0; k < kcap; k++) add(elInteractive(kids[k]))
   }
 
   if (!isFinite(x1) || x2 <= x1 || y2 <= y1) return null
@@ -221,7 +300,21 @@ function reportRect() {
   //    等面板真的关掉（syncExpand 收窗）之后，reportRect 才会重新接管。
   //    这跟 main.js 里 `if (hotState.expanded) return` 是一对镜像，两边互斥、方向一致。
   if (expanded) return
-  const r = interactiveRect()
+  const raw = interactiveRect()
+  // 诊断（排查抖动时用）：把原始矩形也记下来，看清是谁在跳
+  try {
+    const rk = raw ? `${Math.round(raw.x)},${Math.round(raw.y)},${Math.round(raw.w)},${Math.round(raw.h)}` : 'none'
+    if (rk !== lastRawKey) {
+      const prev = lastRawKey
+      lastRawKey = rk
+      if (raw && prev !== '' && prev !== 'none') {
+        const p = prev.split(',').map(Number)
+        const d = Math.max(Math.abs(raw.x - p[0]), Math.abs(raw.y - p[1]), Math.abs(raw.w - p[2]), Math.abs(raw.h - p[3]))
+        if (d >= 6) ipcRenderer.send('dshw:log', `rawrect ${prev} → ${rk} (Δ${Math.round(d)})`)
+      }
+    }
+  } catch (err) {}
+  const r = stabilizeRect(raw)
   // 出屏部分不报（主进程会再裁一次）；这里只上报原始页面坐标
   const key = r
     ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`
@@ -229,6 +322,37 @@ function reportRect() {
   if (key === lastKey) return
   lastKey = key
   try { ipcRenderer.send('dshw:hot-rect', r) } catch (err) {}
+}
+let lastRawKey = ''
+
+// 矩形死区（dead-band）：即便已经改用布局值，边缘吸附/重排仍会有几像素变化。
+// 只要变化小于阈值就**沿用上次上报的矩形**，不让这点噪声走到主进程的 setBounds。
+//
+// 规则：
+//   · 四条边位移都在 DEADBAND 像素内 → 不更新（沿用旧值）
+//   · 任一边超过 DEADBAND → 立刻更新（真实的移动/缩放要跟手）
+//   · 但若「尺寸」变化超过 SIZE_JUMP，说明是面板开/关这种结构性变化 → 立刻更新
+const DEADBAND = 6
+const SIZE_JUMP = 24
+let stableRect = null
+
+function stabilizeRect(r) {
+  if (!r) { stableRect = null; return null }
+  if (!stableRect) { stableRect = { ...r }; return stableRect }
+  const dLeft = Math.abs(r.x - stableRect.x)
+  const dTop = Math.abs(r.y - stableRect.y)
+  const dRight = Math.abs((r.x + r.w) - (stableRect.x + stableRect.w))
+  const dBottom = Math.abs((r.y + r.h) - (stableRect.y + stableRect.h))
+  const dW = Math.abs(r.w - stableRect.w)
+  const dH = Math.abs(r.h - stableRect.h)
+  // 结构性变化（面板开/关、尺寸档位切换）：立刻采纳
+  if (dW >= SIZE_JUMP || dH >= SIZE_JUMP) { stableRect = { ...r }; return stableRect }
+  // 四条边的位移都在死区内 → 认为没变，沿用旧矩形（消抖核心）
+  if (dLeft < DEADBAND && dTop < DEADBAND && dRight < DEADBAND && dBottom < DEADBAND) {
+    return stableRect
+  }
+  stableRect = { ...r }
+  return stableRect
 }
 
 function hasOpenPopup() {
@@ -282,8 +406,9 @@ function syncExpand() {
     if (!hasOpenPopup() && collapseStrikes >= COLLAPSE_STRIKES_NEEDED) {
       collapseStrikes = 0
       setExpanded(false)
-      // 收窗后 lastKey 必须失效，否则 reportRect 会以为「矩形没变」而不补报
+      // 收窗后 lastKey / stableRect 都必须失效，否则 reportRect 会以为「矩形没变」而不补报
       lastKey = ''
+      stableRect = null
       reportRect()
     }
   }, COLLAPSE_DELAY)
@@ -378,6 +503,7 @@ document.addEventListener('mouseleave', () => { if (!pointerDown) pushIgnore(tru
 ipcRenderer.on('dshw:input-mode', (e, m) => {
   mode = m === 'window' ? 'window' : 'hot'
   lastKey = ''
+  stableRect = null
   if (mode === 'hot') {
     startRectLoop()
     sync()
@@ -414,4 +540,29 @@ contextBridge.exposeInMainWorld('__dshwOverlay', {
   rect: () => interactiveRect(),
   mode: () => mode,
   log: (m) => { try { ipcRenderer.send('dshw:log', String(m)) } catch (err) {} },
+  // 诊断：列出当前「被算进并集」的元素，用来定位矩形是谁贡献的
+  diagnose: () => {
+    const out = []
+    let root = null
+    try { root = document.querySelector('.dshwv-root') } catch (err) {}
+    if (root) {
+      let nodes = []
+      try { nodes = root.querySelectorAll('*') } catch (err) {}
+      for (let i = 0; i < nodes.length && i < 600; i++) {
+        const r = elInteractive(nodes[i])
+        if (!r) continue
+        const cls = (nodes[i].className && String(nodes[i].className)) || ''
+        out.push({ cls: cls.slice(0, 60), x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) })
+      }
+    }
+    let pops = []
+    try { pops = document.querySelectorAll(OVERLAY_SEL) } catch (err) {}
+    for (let i = 0; i < pops.length; i++) {
+      if (!popupVisible(pops[i])) continue
+      const b = pops[i].getBoundingClientRect()
+      out.push({ cls: 'POPUP:' + String(pops[i].className).slice(0, 50), x: Math.round(b.left), y: Math.round(b.top), w: Math.round(b.width), h: Math.round(b.height) })
+    }
+    try { ipcRenderer.send('dshw:log', 'DIAG ' + JSON.stringify({ rect: interactiveRect(), expanded, n: out.length, items: out.slice(0, 40) })) } catch (err) {}
+    return out
+  },
 })
