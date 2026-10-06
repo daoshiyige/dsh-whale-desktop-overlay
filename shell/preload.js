@@ -50,32 +50,54 @@ function elVisible(el) {
 // 「弹出层」选择器：挂件的设置面板/对话框/遮罩**不在 .dshwv-root 子树里**，
 // 而是 position:fixed 挂在 body 上、铺满全屏（inset:0）。只扫 root 会完全漏掉它们，
 // 表现就是「低干扰模式下点不动选项」。
-// 取值来自挂件自己的 z-index 分层表：20000–22999 遮罩层、26000+ 小浮层/面板。
+//
+// 取值来自挂件源码实证（把所有 `xxxMask.className = '...'` 与 `style.display='flex'` 的对象都对了一遍）：
+//   · 遮罩：cropmask / gifmask / resmask / audiomask / bubmask / snapmask / confirmmask / usage-mask
+//     —— 多个变量复用同一类名（audioCropMask→audiomask、audioEditMask→audiomask、
+//     bubbleItemMask·moduleMask→bubmask、moduleNamePromptMask→confirmmask、usageMoreMask→usage-mask），
+//     所以类名清单就是全集，不用再枚举变量。
+//   · 小浮层：qedit(26000) / usage-sub（usage 面板里展开的明细层）
+//   · 列表/菜单：menu(10000) rolelist·audiolist(10001) slotlist(20600) colpop(30) rgbmenu(60)
+//
+// ⚠️ **不要**把 .dshwv-*-win 加进来：那些是遮罩内部的卡片，CSS 里没有 display:none，
+//    显隐完全靠父遮罩。它们常驻 DOM，加进来会让热点窗**永久展开**。
+//
+// ⚠️ 每种元素的显隐机制并不统一，所以判定必须靠 display，不能靠 rect/opacity 猜：
+//   · 遮罩类：**常驻 DOM**，`style.display='none'/'flex'` 直接切（源码里 73 处 none、36 处 flex）
+//   · 列表类（rolelist/audiolist/slotlist/rgbmenu）：CSS 里 `display:none`，靠 `-open` 类切 `display:block`
+//   · 菜单 .dshwv-menu：常驻、`opacity:0` + `pointer-events:none`，靠 opacity 过渡显示
+//   · qedit / usage-sub：`style.display` 直控，动态增删
+// 统一收敛到「computed display !== 'none'」这一条：它同时覆盖内联 style、类、CSS 三种来源。
 const OVERLAY_SEL = [
   '.dshwv-cropmask', '.dshwv-gifmask', '.dshwv-resmask', '.dshwv-audiomask',
   '.dshwv-bubmask', '.dshwv-snapmask', '.dshwv-confirmmask', '.dshwv-usage-mask',
-  '.dshwv-usagepanel', '.dshwv-qedit', '.dshwv-custmenu', '.dshwv-colpop', '.dshwv-rgbmenu',
+  '.dshwv-usage-sub', '.dshwv-qedit', '.dshwv-colpop', '.dshwv-rgbmenu',
   '.dshwv-rolelist', '.dshwv-audiolist', '.dshwv-slotlist', '.dshwv-menu',
 ].join(',')
 
-// 弹出层是否真的「开着」：挂件用 open 类 / display / 可见性 三套信号，都要认
+// 只认「自己」的 display，不看祖先 —— 否则面板套在 root 里时会被 root 的状态干扰。
+// 祖先链上有 display:none 的话 getComputedStyle 自己也会是 none，无需额外判断。
 function popupVisible(el) {
+  if (!el || !el.isConnected) return false
   let cs = null
   try { cs = getComputedStyle(el) } catch (err) { return false }
   if (!cs) return false
-  if (cs.display === 'none' || cs.visibility === 'hidden') return false
-  if (Number(cs.opacity || 1) < 0.05) return false
-  const cls = el.className
-  const clsStr = typeof cls === 'string' ? cls : (cls && cls.baseVal) || ''
-  // 带 open 类的一定是开着（挂件用 .dshwv-xxx-open 控制显隐）
-  if (/-open\b/.test(clsStr)) return true
-  // 遮罩类：position:fixed + inset:0 且没被 display 关掉，就算开着
-  if (cs.position === 'fixed' && cs.display !== 'none') {
-    let r = null
-    try { r = el.getBoundingClientRect() } catch (err) { return false }
-    return !!r && r.width > 1 && r.height > 1
-  }
-  return false
+  // ① 决定性信号：display
+  if (cs.display === 'none') return false
+  // ② visibility:hidden 明确不可交互
+  if (cs.visibility === 'hidden') return false
+  // ③ .dshwv-menu 这类靠 opacity 过渡显隐的：**必须等过渡结束**（opacity 到位）才算开，
+  //    中途（如 0.4）不算 —— 否则过渡期间会「开→关→开」抖。
+  //    用 0.9 而不是 0.05：只有真正显示出来（近乎全不透明）才认。
+  const op = Number(cs.opacity)
+  if (Number.isFinite(op) && op < 0.9) return false
+  // ④ 有实际面积（排除 0 尺寸的占位节点）
+  let r = null
+  try { r = el.getBoundingClientRect() } catch (err) { return false }
+  if (!r || r.width < 1 || r.height < 1) return false
+  // ⑤ 完全在视口外的不算（离屏占位）
+  if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) return false
+  return true
 }
 
 function interactiveRect() {
@@ -153,6 +175,12 @@ function reportRect() {
 //    所以这里的唯一触发源是 DOM 变化，与鼠标无关。
 let expanded = false
 let collapseTimer = null
+// 收窗防抖：单次「读到关」不算数，必须连续 N 次都关才收。
+// 面板关闭往往伴随一小段 DOM 抖动（面板节点被移除 / 遮罩 display 切换），
+// 单次读数很容易瞬时为 false —— 这就是「鼠标在按钮上移动时模式来回切」的成因。
+let collapseStrikes = 0
+const COLLAPSE_STRIKES_NEEDED = 3
+const COLLAPSE_DELAY = 900
 
 function hasOpenPopup() {
   let pops = []
@@ -182,20 +210,31 @@ function setExpanded(on) {
   try { ipcRenderer.send('dshw:hot-expand', on) } catch (err) {}
 }
 
-// 由 DOM 变化 / 轮询驱动。面板开着就保持扩窗，关掉后延时收回（避免刚关又开的抖动）
+// 由 DOM 变化 / 轮询驱动。
+//   开：任何一次读到「有面板」→ 立刻扩（宁可早，晚了第一下点击就丢）
+//   关：连续 COLLAPSE_STRIKES_NEEDED 次都读到「无面板」，且距上次「有面板」超过
+//       COLLAPSE_DELAY，才真的收（防抖动 / 防面板切换之间的瞬时空档）
 function syncExpand() {
   if (mode !== 'hot') return
   const open = hasOpenPopup()
   if (open) {
+    collapseStrikes = 0
     if (collapseTimer) { clearTimeout(collapseTimer); collapseTimer = null }
     setExpanded(true)
-  } else if (expanded) {
-    if (collapseTimer) return
-    collapseTimer = setTimeout(() => {
-      collapseTimer = null
-      if (!hasOpenPopup()) setExpanded(false)
-    }, 600)
+    return
   }
+  if (!expanded) return
+  collapseStrikes++
+  if (collapseStrikes < COLLAPSE_STRIKES_NEEDED) return
+  if (collapseTimer) return
+  collapseTimer = setTimeout(() => {
+    collapseTimer = null
+    // 定时器到点时再复核一次：期间又开了就作废
+    if (!hasOpenPopup() && collapseStrikes >= COLLAPSE_STRIKES_NEEDED) {
+      collapseStrikes = 0
+      setExpanded(false)
+    }
+  }, COLLAPSE_DELAY)
 }
 
 function startRectLoop() {
