@@ -1,0 +1,9 @@
+{
+  "name": "dshw-overlay-shell",
+  "version": "1.0.0",
+  "private": true,
+  "description": "dsh-whale-widget 桌面悬浮薄壳（全屏透明置顶窗口 + 鼠标穿透）",
+  "main": "main.js",
+  "author": "local patch",
+  "license": "MIT"
+}

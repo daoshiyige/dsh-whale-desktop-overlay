@@ -1,0 +1,7 @@
+_selftest/
+node_modules/
+*.log
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
