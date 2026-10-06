@@ -25,11 +25,15 @@ try { CFG = JSON.parse(process.env.DSHW_OVERLAY_CONFIG || '{}') } catch (err) { 
 
 let mode = CFG.inputMode === 'window' ? 'window' : 'hot'
 
+// 诊断探针开关（排查用；主进程通过 DSHW_PROBE=1 打开）
+const PROBE = process.env.DSHW_PROBE === '1'
+
 // ---------------------------------------------------------------------------
 // hot 模式：上报可交互区域
 // ---------------------------------------------------------------------------
 let lastKey = ''
 let rectTimer = null
+let probeTimer = null
 
 // ---------------------------------------------------------------------------
 // 统一的 opacity 滞后判定（elVisible 与 popupVisible 共用，绝不能各写一套）
@@ -224,6 +228,29 @@ function rootBox(root) {
   return r
 }
 
+// ---------------------------------------------------------------------------
+// ⭐ 面板几何：必须让热点窗**盖住面板**，否则面板点不动
+// ---------------------------------------------------------------------------
+// 实测（本机 1707×1019 工作区，鲸鱼贴右下角）：
+//     落点盒 y=770~1020        （鲸鱼本体，250×250）
+//     设置面板 y=565~865       （242×300 —— position:fixed 挂在 body 上）
+//     热点窗   y=756~1034      （= 落点盒 + padding 14）
+//   ⇒ 面板顶边 565 到 756 这 **191px 完全没有任何窗口**接收鼠标，
+//     面板只有底部的 109px（36%）能点 —— 用户看到的「无法点击」。
+//
+//  根本原因：面板是 `position:fixed` 挂在 **body** 上（源码 positionMenu() 里
+//  `menuBox.style.bottom = vp.h - assetTop + 6`），它的定位基准是视口，
+//  而挂件贴在屏幕右下角时面板必然**向上展开**、整个落在鲸鱼包围盒之外。
+//
+//  历史包袱：曾经靠「扫 root 子树」意外把面板并进了并集（子树里的节点 rect
+//  恰好覆盖了面板），但那个做法会把并集炸到整个视口（见下方说明），
+//  所以上一轮把它删掉了 —— 面板随之变得点不动。这是本次修复要补回来的东西。
+//
+//  正确做法：**显式把可见弹出层的矩形并进来**（interactiveRect 第 ② 步已经在做），
+//  并且**不要**依赖 expanded 抢先扩窗独自承担（它只覆盖"面板弹出的那一瞬"，
+//  且会被 6s 阈值 / 收起防抖影响）。让「上报矩形」这条常规通路自己就包含面板。
+// ---------------------------------------------------------------------------
+
 function interactiveRect() {
   let root = null
   try { root = document.querySelector('.dshwv-root') } catch (err) { root = null }
@@ -299,7 +326,28 @@ function reportRect() {
   //    所以：**只要已判定为「扩窗态」，就不再上报小矩形**，由 applyHotExpand 全权掌尺寸；
   //    等面板真的关掉（syncExpand 收窗）之后，reportRect 才会重新接管。
   //    这跟 main.js 里 `if (hotState.expanded) return` 是一对镜像，两边互斥、方向一致。
-  if (expanded) return
+  //
+  // ⚠️⚠️ 但这个让路有一个致命前提：**expanded 必须真的代表「主进程那边也扩了」**。
+  //    expanded 是从本页发出的（setExpanded → ipc），主进程收到才扩窗。如果主进程那边
+  //    因为 drag / 热点窗不可用等原因**拒绝了扩窗**，本页却已经把 expanded 置 true，
+  //    那么 reportRect 会永久让路 ⇒ 一次矩形都不再上报 ⇒ 热点窗停在旧位置 ⇒
+  //    「整个鲸鱼都点不动」（实测事故：hotUpdates 卡在 1、hotEvents=0）。
+  //    所以这里加一道**兜底心跳**：即使处于 expanded 态，也至少每 EXPIRE_MS 上报一次
+  //    真实矩形，保证主进程永远能靠常规通路自愈。
+  if (expanded) {
+    const now = Date.now()
+    if (now - lastReportAt < EXPANDED_KEEPALIVE_MS) return
+    lastReportAt = now
+    const rk = interactiveRect()
+    if (rk) {
+      lastKey = ''
+      stableRect = null
+      const r = stabilizeRect(rk)
+      lastKey = r ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}` : 'none'
+      try { ipcRenderer.send('dshw:hot-rect', r) } catch (err) {}
+    }
+    return
+  }
   const raw = interactiveRect()
   // 诊断（排查抖动时用）：把原始矩形也记下来，看清是谁在跳
   try {
@@ -324,6 +372,9 @@ function reportRect() {
   try { ipcRenderer.send('dshw:hot-rect', r) } catch (err) {}
 }
 let lastRawKey = ''
+// expanded 态下的兜底上报节奏（见 reportRect 开头说明）
+const EXPANDED_KEEPALIVE_MS = 1200
+let lastReportAt = 0
 
 // 矩形死区（dead-band）：即便已经改用布局值，边缘吸附/重排仍会有几像素变化。
 // 只要变化小于阈值就**沿用上次上报的矩形**，不让这点噪声走到主进程的 setBounds。
@@ -422,10 +473,45 @@ function sync() {
   reportRect()
 }
 
+// ---------------------------------------------------------------------------
+// 诊断探针（只在 DSHW_PROBE=1 时启用）
+// ---------------------------------------------------------------------------
+// 目的：把「谁是矩形贡献者」这件事变成可读数据，而不是靠猜。
+//   每个 tick 记录：root 落点盒、菜单实测盒、本轮上报盒，
+//   以及菜单是否**落在 root 盒之外**（那就是「面板点不动」的几何证据）。
+function probeTick() {
+  if (!PROBE) return
+  try {
+    const root = document.querySelector('.dshwv-root')
+    const rb = rootBox(root)
+    const menu = document.querySelector('.dshwv-menu')
+    let mb = null
+    let mOpen = null
+    if (menu) {
+      try { const b = menu.getBoundingClientRect(); mb = { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) } } catch (err) {}
+      try { mOpen = menu.classList.contains('dshwv-menu-open') } catch (err) {}
+    }
+    const outside = (rb && mb)
+      ? (mb.x < rb.left - 1 || mb.y < rb.top - 1 || mb.x + mb.w > rb.right + 1 || mb.y + mb.h > rb.bottom + 1)
+      : null
+    ipcRenderer.send('dshw:probe', {
+      raw: lastRawKey,
+      stable: stableRect,
+      expanded,
+      openPopup: hasOpenPopup(),
+      rootBox: rb ? { x: Math.round(rb.left), y: Math.round(rb.top), w: Math.round(rb.width), h: Math.round(rb.height) } : null,
+      menu: mb,
+      menuOpen: mOpen,
+      menuOutsideRoot: outside,
+    })
+  } catch (err) {}
+}
+
 function startRectLoop() {
   if (rectTimer) return
   // 200ms 足够跟上拖动/四边吸附；挂件本身的位置变化不会比这更快
   rectTimer = setInterval(sync, 200)
+  if (PROBE && !probeTimer) probeTimer = setInterval(probeTick, 250)
   window.addEventListener('resize', sync)
   window.addEventListener('scroll', sync, true)
   // 挂件被 SPA 摘掉又重挂、或切换角色/尺寸时也能及时更新
@@ -504,11 +590,20 @@ ipcRenderer.on('dshw:input-mode', (e, m) => {
   mode = m === 'window' ? 'window' : 'hot'
   lastKey = ''
   stableRect = null
+  // ⚠️ 必须连同 expanded / 收起防抖一起复位：
+  //    切走再切回时若还留着 expanded=true，reportRect 会（在 keepalive 生效前）
+  //    继续让路，而主进程那边热点窗是重建的、并没有处于扩窗态 —— 两边状态撕裂，
+  //    表现就是「切回 hot 模式后热点窗永远停在初始位置、点不动」。
+  expanded = false
+  collapseStrikes = 0
+  if (collapseTimer) { clearTimeout(collapseTimer); collapseTimer = null }
+  lastReportAt = 0
   if (mode === 'hot') {
     startRectLoop()
     sync()
   } else {
     if (rectTimer) { clearInterval(rectTimer); rectTimer = null }
+    if (probeTimer) { clearInterval(probeTimer); probeTimer = null }
     try { ipcRenderer.send('dshw:hot-rect', null) } catch (err) {}
     ignoring = null
     pushIgnore(true)

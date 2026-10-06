@@ -102,7 +102,9 @@ try { fs.mkdirSync(SHOT_DIR, { recursive: true }) } catch (err) {}
 fs.writeFileSync(path.join(TMP, 'config.json'), JSON.stringify({
   enabled: true,
   autoStart: true,
-  port: 37917,
+  // ⚠️ 用非默认端口：实例锁 = 端口 + 1000。用 37917 会和「正在跑的生产悬浮层」
+  //    抢同一把锁（实测直接 EADDRINUSE 退出，自检什么都测不到）。
+  port: Number(process.env.DSHW_SELFTEST_PORT || 37961),
   bounds: 'screen',
   alwaysOnTop: true,
   clickThrough: true,
@@ -125,6 +127,15 @@ process.env.DSHW_OVERLAY_CAPTURE_DELAY = '9000'
 // 让壳在截图前先在热点窗里造一次「按下 → 拖动 → 抬起」，
 // 用来验证 热点窗 → IPC → sendInputEvent → 主窗 这条合成输入链路真的通。
 process.env.DSHW_HOT_SELFTEST = '1'
+// 诊断场景（默认关闭）：脚本化点开设置面板，测量「面板几何 vs 落点盒」并验证面板可点。
+// 打开方式：DSHW_MENU_PROBE=1 node selftest.mjs
+if (process.env.DSHW_MENU_PROBE === '1') process.env.DSHW_MENU_PROBE = '1'
+// 诊断探针：把页面几何（落点盒 / 菜单盒 / 是否落在盒外）每 250ms 落盘，
+// 用来验证「面板点不动」的几何根因。默认开启，产物：<TMP>/run/probe.jsonl
+const PROBE = path.join(TMP, 'run', 'probe.jsonl')
+try { fs.rmSync(PROBE, { force: true }) } catch (err) {}
+process.env.DSHW_PROBE = process.env.DSHW_MENU_PROBE === '1' ? '1' : '0'
+process.env.DSHW_PROBE_PATH = PROBE
 
 // ---- mock 路由表（真实资源 + 形状合理的 JSON）----
 const widgetJs = readText(path.join(ASSETS, 'whale-widget.js'))

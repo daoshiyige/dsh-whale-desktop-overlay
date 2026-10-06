@@ -496,6 +496,13 @@ function spawnShell(st, log, override) {
   })
 
   log.info(`拉起悬浮窗壳进程：${exe}（端口 ${port}${cfg.disableGpu ? '，软件合成' : ''}）`)
+  // 诊断探针透传：排查「矩形归属 / 面板为何点不动」时把页面几何落盘。
+  // 默认关闭，不影响正常运行。
+  if (process.env.DSHW_PROBE === '1') {
+    env.DSHW_PROBE = '1'
+    if (process.env.DSHW_PROBE_PATH) env.DSHW_PROBE_PATH = process.env.DSHW_PROBE_PATH
+    log.info(`诊断探针已开启：${env.DSHW_PROBE_PATH || '(未指定落盘路径)'}`)
+  }
   let child
   try {
     child = spawn(exe, [SHELL_DIR], {

@@ -90,8 +90,10 @@ function mark(stage, extra) {
 }
 
 // Electron 常规开关 —— 必须在 ready 之前
-try { app.setPath('userData', path.join(RUN_DIR, 'userdata')) } catch (err) {}
-try { fs.mkdirSync(path.join(RUN_DIR, 'userdata'), { recursive: true }) } catch (err) {}
+// 诊断台可用 DSHW_USERDATA 指定独立数据目录，避免与正在运行的生产实例抢缓存
+const USERDATA = process.env.DSHW_USERDATA || path.join(RUN_DIR, 'userdata')
+try { app.setPath('userData', USERDATA) } catch (err) {}
+try { fs.mkdirSync(USERDATA, { recursive: true }) } catch (err) {}
 if (CFG.disableGpu) {
   // 某些机器/驱动组合下 GPU 进程会连续崩溃，最后 Chromium 直接 "GPU process isn't usable. Goodbye."
   // 全屏透明窗口走软件合成完全没问题，所以这里给它一条退路。
@@ -334,8 +336,22 @@ function applyHotRect(rect) {
   }
   // 拖动期间冻结：热点窗跟着鲸鱼跑会让相对坐标恒定（鲸鱼原地追自己），拖动会失效
   if (hotState.drag) return
-  // 扩窗期间交给 applyHotExpand 全权处理，避免两边抢 setBounds 造成抖动
-  if (hotState.expanded) return
+  // 扩窗期间交给 applyHotExpand 全权处理，避免两边抢 setBounds 造成抖动。
+  // ⚠️ 但**只有真的处于扩窗态才让路**：expanded 是本进程自己置的，如果这里为 true
+  //    而窗口实际并没有铺满（例如被 drag 打断、或扩窗那次 setBounds 失败了），
+  //    继续 return 就会让热点窗永久停在旧位置 —— 面板点不动、连鲸鱼也点不动。
+  //    用「当前窗口是否≈全屏」复核一遍，不一致就按普通矩形贴合（自愈）。
+  if (hotState.expanded) {
+    let cb = null
+    try { cb = hot ? hot.getBounds() : null } catch (err) { cb = null }
+    let wb = null
+    try { wb = win && !win.isDestroyed() ? win.getBounds() : null } catch (err) { wb = null }
+    const reallyExpanded = !!(cb && wb && cb.width >= wb.width - 4 && cb.height >= wb.height - 4)
+    if (reallyExpanded) return
+    // 状态与事实不符 → 修正状态，走上面的贴合通路
+    hotState.expanded = false
+    log('扩窗态与窗口实况不符（窗口 ' + JSON.stringify(cb) + '），按常规矩形重新贴合')
+  }
   let mb = null
   try { mb = win && !win.isDestroyed() ? win.getBounds() : null } catch (err) { mb = null }
   if (!mb) return
@@ -637,6 +653,17 @@ ipcMain.on('dshw:hot-expand', (e, on) => applyHotExpand(!!on))
 ipcMain.on('dshw:hot-input', (e, ev) => relayInput(ev))
 ipcMain.on('dshw:log', (e, msg) => log('[page] ' + String(msg).slice(0, 400)))
 ipcMain.on('dshw:quit', () => app.quit())
+
+// 诊断探针：把「当前几何真相」落盘（排查矩形归属用，不影响正常流程）
+// 探针文件路径由环境变量给出，内容是页面里各候选盒子的实测值。
+ipcMain.on('dshw:probe', (e, obj) => {
+  const p = process.env.DSHW_PROBE_PATH
+  if (!p) return
+  try {
+    const line = JSON.stringify({ at: new Date().toISOString(), ...obj }) + '\n'
+    fs.appendFileSync(p, line)
+  } catch (err) {}
+})
 ipcMain.on('dshw:reload', () => { try { if (win) win.webContents.reload() } catch (err) {} })
 
 // 仅 window 模式使用（旧行为）
@@ -801,11 +828,106 @@ async function hotRelaySelfTest() {
 }
 
 let gpuCrashes = 0
-app.on('gpu-process-crashed', () => { gpuCrashes++; mark('gpu-crashed', { gpuCrashes }) })
 app.on('child-process-gone', (e, d) => {
   if (d && d.type === 'GPU') { gpuCrashes++; mark('gpu-gone', { gpuCrashes, detail: d }) }
   else log('child-process-gone ' + JSON.stringify(d))
 })
+
+// ---------------------------------------------------------------------------
+// 诊断场景：脚本化地「点开设置面板」，把几何真相落盘
+// ---------------------------------------------------------------------------
+// 只验证一件事：**面板的矩形是否落在 root 落点盒之外**。
+//   落点盒 = 我们用来摆热点窗的矩形；面板在盒外 ⇒ 那一片区域根本没有窗口接收鼠标
+//   ⇒ 现象就是「面板点不动」。这是纯几何判定，与动画/时序无关，可离线复现。
+async function menuProbeScenario() {
+  if (process.env.DSHW_PROBE !== '1' || !process.env.DSHW_MENU_PROBE) return
+  await new Promise((r) => setTimeout(r, 3500))
+  try {
+    const before = await win.webContents.executeJavaScript(`(function(){
+      var root=document.querySelector('.dshwv-root'); if(!root) return {err:'no-root'};
+      var r=root.getBoundingClientRect();
+      var m=document.querySelector('.dshwv-menu');
+      var mb=m?m.getBoundingClientRect():null;
+      var btn=document.querySelector('.dshwv-menu-btn');
+      var bb=btn?btn.getBoundingClientRect():null;
+      return { root:{x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)},
+               inline:{left:root.style.left,top:root.style.top},
+               menu:mb?{x:Math.round(mb.left),y:Math.round(mb.top),w:Math.round(mb.width),h:Math.round(mb.height)}:null,
+               menuCls:m?String(m.className):null,
+               btn:bb?{x:Math.round(bb.left),y:Math.round(bb.top),w:Math.round(bb.width),h:Math.round(bb.height)}:null,
+               btnCls:btn?String(btn.className):null } })()`).catch(() => null)
+    log('MENU-PROBE 打开前 ' + JSON.stringify(before))
+    // 用页面自己的方式开菜单：点菜单按钮（挂件监听的是 click）
+    const opened = await win.webContents.executeJavaScript(`(function(){
+      var btn=document.querySelector('.dshwv-menu-btn'); if(!btn) return 'no-btn';
+      btn.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
+      return 'clicked' })()`).catch((e) => 'err:' + String(e && e.message))
+    log('MENU-PROBE 点击结果 ' + opened)
+    await new Promise((r) => setTimeout(r, 1200))
+    const after = await win.webContents.executeJavaScript(`(function(){
+      var root=document.querySelector('.dshwv-root'); if(!root) return {err:'no-root'};
+      var r=root.getBoundingClientRect();
+      var m=document.querySelector('.dshwv-menu');
+      var mb=m?m.getBoundingClientRect():null;
+      var cs=m?getComputedStyle(m):null;
+      return { root:{x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)},
+               inlineLeft:root.style.left, inlineTop:root.style.top,
+               menu:mb?{x:Math.round(mb.left),y:Math.round(mb.top),w:Math.round(mb.width),h:Math.round(mb.height)}:null,
+               menuCls:m?String(m.className):null,
+               menuDisp:cs?cs.display:null, menuOp:cs?cs.opacity:null, menuPE:cs?cs.pointerEvents:null } })()`).catch(() => null)
+    log('MENU-PROBE 打开后 ' + JSON.stringify(after))
+    // 判定：面板是否落在「落点盒」之外
+    if (after && after.root && after.menu) {
+      const outside = after.menu.x < after.root.x - 1
+        || after.menu.y < after.root.y - 1
+        || after.menu.x + after.menu.w > after.root.x + after.root.w + 1
+        || after.menu.y + after.menu.h > after.root.y + after.root.h + 1
+      const gapTop = after.root.y - (after.menu.y + after.menu.h)
+      log(`MENU-PROBE 判定：面板在落点盒之外=${outside} 面板底边到鲸鱼顶部间距=${Math.round(gapTop)}px（>0 表示面板悬在盒外）`)
+      mark('menu-probe', { outside, gapTop: Math.round(gapTop), root: after.root, menu: after.menu })
+    }
+
+    // ---- 关键验证：在**面板区域内**做一次真实点击，看挂件是否收到 ----
+    // 面板 y=565~865，鲸鱼 y=770~1020 ⇒ 取 y=650（面板上、鲸鱼外）作落点。
+    // 若热点窗没有覆盖到那里，这一下点击会掉进「没有窗口」的真空 → 挂件收不到任何事件。
+    const pt = await win.webContents.executeJavaScript(`(function(){
+      var m=document.querySelector('.dshwv-menu'); if(!m) return null;
+      var b=m.getBoundingClientRect(); if(!b||b.height<10) return null;
+      // 取面板里第一个真正可点的控件（按钮/输入/带 pointer-events:auto 的元素）
+      var cands=m.querySelectorAll('button,input,select,[role=button],.dshwv-mi,.dshwv-menu-item,div,span');
+      for (var i=0;i<cands.length;i++){
+        var el=cands[i], r=el.getBoundingClientRect();
+        if (r.width<8||r.height<8) continue;
+        var cs=getComputedStyle(el);
+        if (cs.pointerEvents!=='auto'&&cs.pointerEvents!=='all') continue;
+        if (cs.display==='none'||cs.visibility==='hidden') continue;
+        return { x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2),
+                 tag:el.tagName, cls:String(el.className).slice(0,50) };
+      }
+      return { x:Math.round(b.left+b.width/2), y:Math.round(b.top+20), tag:'MENU', cls:'fallback' } })()`).catch(() => null)
+    log('MENU-PROBE 面板落点 ' + JSON.stringify(pt))
+    if (pt && hot && !hot.isDestroyed()) {
+      const hb = hot.getBounds()
+      const mb = win.getBounds()
+      const lx = Math.round(pt.x - hb.x + mb.x)
+      const ly = Math.round(pt.y - hb.y + mb.y)
+      const inHot = lx >= 0 && ly >= 0 && lx <= hb.width && ly <= hb.height
+      log(`MENU-PROBE 热点窗 ${JSON.stringify(hb)} 落点→窗内(${lx},${ly}) 在窗内=${inHot}`)
+      if (inHot) {
+        const before = await win.webContents.executeJavaScript(`(function(){window.__mprobe=[];var t=['mousedown','mouseup','click'];t.forEach(function(k){document.addEventListener(k,function(e){window.__mprobe.push(k+'@'+Math.round(e.clientX)+','+Math.round(e.clientY)+' '+(e.target.className||e.target.tagName))},true)})})()`).catch(() => {})
+        await hot.webContents.executeJavaScript(`window.__dshwHot && window.__dshwHot.inject('mouseDown',${lx},${ly},'left')`).catch(() => {})
+        await new Promise((r) => setTimeout(r, 60))
+        await hot.webContents.executeJavaScript(`window.__dshwHot && window.__dshwHot.inject('mouseUp',${lx},${ly},'left')`).catch(() => {})
+        await new Promise((r) => setTimeout(r, 400))
+        const got = await win.webContents.executeJavaScript(`JSON.stringify(window.__mprobe||[])`).catch(() => '[]')
+        log('MENU-PROBE 面板点击结果（挂件收到的事件）:' + got)
+        mark('menu-click', { point: pt, local: { x: lx, y: ly }, inHot, got: String(got) })
+      }
+    }
+  } catch (err) {
+    log('MENU-PROBE 失败：' + String((err && err.message) || err))
+  }
+}
 
 app.whenReady().then(async () => {
   log(`Electron ${process.versions.electron} / Chrome ${process.versions.chrome} / Node ${process.versions.node}`)
@@ -821,6 +943,7 @@ app.whenReady().then(async () => {
   buildTray()
   startHealth()
   hotRelaySelfTest().finally(() => maybeCapture())
+  menuProbeScenario()
 })
 
 app.on('window-all-closed', () => app.quit())
