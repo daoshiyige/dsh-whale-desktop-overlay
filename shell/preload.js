@@ -75,8 +75,50 @@ const OVERLAY_SEL = [
   '.dshwv-rolelist', '.dshwv-audiolist', '.dshwv-slotlist', '.dshwv-menu',
 ].join(',')
 
+// 纯类名版本（去掉点号），给 transitionend 兜底做 classList.contains 用
+const OVERLAY_CLASSES = OVERLAY_SEL.split(',').map((s) => s.trim().slice(1))
+
 // 只认「自己」的 display，不看祖先 —— 否则面板套在 root 里时会被 root 的状态干扰。
 // 祖先链上有 display:none 的话 getComputedStyle 自己也会是 none，无需额外判断。
+//
+// ⚠️ opacity 的判定必须**滞后（latch）**，不能每次读数直接比较阈值。
+//    .dshwv-menu 是 `opacity:0 + transition:opacity .22s` 显隐的，面板刚点开时
+//    opacity 会从 0 一路爬到 1，中途必然穿过任何阈值。若直接拿阈值比较：
+//      · 阈值 0.9 → 面板已"看起来开着"的前 0.2s 被误判为关 → 上报小矩形 → 缩窗
+//      · 阈值 0.05 → 关闭动画期间又误判为开 → 上报大矩形 → 扩窗
+//    两个方向都会造成「扩/缩来回切」。所以维护一张 WeakMap：
+//      关→开：opacity 一旦 >= OP_ON(0.5) 就立刻记成开（宁可早，点击不丢）
+//      开→关：必须连续 latchStrikes 次读到 opacity <= OP_OFF(0.1) 才记成关
+//    （配合外层 syncExpand 的三重收窗防抖，双保险。）
+const OP_ON = 0.5
+const OP_OFF = 0.1
+const LATCH_STRIKES_NEEDED = 3
+const opLatch = new WeakMap()   // el -> { on:boolean, low:number }
+
+function opacityAllows(el, cs) {
+  if (!cs || cs.opacity === '' || cs.opacity === undefined) return true
+  const op = Number(cs.opacity)
+  if (!Number.isFinite(op)) return true
+  const st = opLatch.get(el) || { on: false, low: 0 }
+  if (op <= OP_OFF) {
+    st.low++
+    // 连续多次都低才是真的关了；只有一次低（过渡首帧/父级动画）不算
+    if (st.on && st.low < LATCH_STRIKES_NEEDED) { opLatch.set(el, st); return st.on }
+    st.on = false
+    opLatch.set(el, st)
+    return false
+  }
+  if (op >= OP_ON) {
+    st.on = true
+    st.low = 0
+    opLatch.set(el, st)
+    return true
+  }
+  // 中间地带（0.1 ~ 0.5）：维持上一次判定，不翻转 —— 这是消抖的关键
+  opLatch.set(el, st)
+  return st.on
+}
+
 function popupVisible(el) {
   if (!el || !el.isConnected) return false
   let cs = null
@@ -86,11 +128,8 @@ function popupVisible(el) {
   if (cs.display === 'none') return false
   // ② visibility:hidden 明确不可交互
   if (cs.visibility === 'hidden') return false
-  // ③ .dshwv-menu 这类靠 opacity 过渡显隐的：**必须等过渡结束**（opacity 到位）才算开，
-  //    中途（如 0.4）不算 —— 否则过渡期间会「开→关→开」抖。
-  //    用 0.9 而不是 0.05：只有真正显示出来（近乎全不透明）才认。
-  const op = Number(cs.opacity)
-  if (Number.isFinite(op) && op < 0.9) return false
+  // ③ opacity 过渡元素：滞后判定（见上方说明）
+  if (!opacityAllows(el, cs)) return false
   // ④ 有实际面积（排除 0 尺寸的占位节点）
   let r = null
   try { r = el.getBoundingClientRect() } catch (err) { return false }
@@ -149,18 +188,6 @@ function interactiveRect() {
   return { x: nx1, y: ny1, w: nx2 - nx1, h: ny2 - ny1 }
 }
 
-function reportRect() {
-  if (mode !== 'hot') return
-  const r = interactiveRect()
-  // 出屏部分不报（主进程会再裁一次）；这里只上报原始页面坐标
-  const key = r
-    ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`
-    : 'none'
-  if (key === lastKey) return
-  lastKey = key
-  try { ipcRenderer.send('dshw:hot-rect', r) } catch (err) {}
-}
-
 // ---------------------------------------------------------------------------
 // 抢先扩窗
 // ---------------------------------------------------------------------------
@@ -173,6 +200,8 @@ function reportRect() {
 // ⚠️ 千万不要用「鼠标一动就扩窗」——扩窗后热点窗铺满全屏，它自己会吃到 mousemove，
 //    经主窗合成回来又触发本函数，形成毫秒级扩/收死循环（实测每秒几十次 setBounds）。
 //    所以这里的唯一触发源是 DOM 变化，与鼠标无关。
+//
+// 状态声明放在 reportRect 之前 —— reportRect 要读 expanded 来让路（见其内部注释）。
 let expanded = false
 let collapseTimer = null
 // 收窗防抖：单次「读到关」不算数，必须连续 N 次都关才收。
@@ -181,6 +210,26 @@ let collapseTimer = null
 let collapseStrikes = 0
 const COLLAPSE_STRIKES_NEEDED = 3
 const COLLAPSE_DELAY = 900
+
+function reportRect() {
+  if (mode !== 'hot') return
+  // ⚠️ 关键竞态修复：面板刚打开时（.dshwv-menu 的 opacity 还在 0.22s 过渡中途），
+  //    interactiveRect() 会暂时只算到鲸鱼本体 → 上报小矩形 → 主进程 applyHotRect 缩窗；
+  //    等过渡结束才又上报大矩形 → syncExpand 扩窗。一来一回就是用户看到的「抖」。
+  //
+  //    所以：**只要已判定为「扩窗态」，就不再上报小矩形**，由 applyHotExpand 全权掌尺寸；
+  //    等面板真的关掉（syncExpand 收窗）之后，reportRect 才会重新接管。
+  //    这跟 main.js 里 `if (hotState.expanded) return` 是一对镜像，两边互斥、方向一致。
+  if (expanded) return
+  const r = interactiveRect()
+  // 出屏部分不报（主进程会再裁一次）；这里只上报原始页面坐标
+  const key = r
+    ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`
+    : 'none'
+  if (key === lastKey) return
+  lastKey = key
+  try { ipcRenderer.send('dshw:hot-rect', r) } catch (err) {}
+}
 
 function hasOpenPopup() {
   let pops = []
@@ -192,16 +241,16 @@ function hasOpenPopup() {
 }
 
 // ⚠️ 第二个抖动源：热点窗接收真实鼠标 → 经主窗合成回页面 → 挂件的 :hover 态改 class
-//   → mo2 又触发 syncExpand()。面板没开时它只是白跑计算（有缓存短路，无害），
+//   → mo2 又触发 sync()。面板没开时它只是白跑计算（有缓存短路，无害），
 //   但「面板正开着、鼠标悬停面板内元素」时会高频触发 → 高频查 popupVisible。
 //   用 60ms 节流把这件事压掉：面板开/关本身是低频的，节流不影响体验。
 let syncAt = 0
 let syncPending = null
-function syncExpandThrottled() {
+function syncThrottled() {
   const now = Date.now()
-  if (now - syncAt >= 60) { syncAt = now; syncExpand(); return }
+  if (now - syncAt >= 60) { syncAt = now; sync(); return }
   if (syncPending) return
-  syncPending = setTimeout(() => { syncPending = null; syncAt = Date.now(); syncExpand() }, 60)
+  syncPending = setTimeout(() => { syncPending = null; syncAt = Date.now(); sync() }, 60)
 }
 
 function setExpanded(on) {
@@ -233,26 +282,49 @@ function syncExpand() {
     if (!hasOpenPopup() && collapseStrikes >= COLLAPSE_STRIKES_NEEDED) {
       collapseStrikes = 0
       setExpanded(false)
+      // 收窗后 lastKey 必须失效，否则 reportRect 会以为「矩形没变」而不补报
+      lastKey = ''
+      reportRect()
     }
   }, COLLAPSE_DELAY)
+}
+
+// 统一入口：**先裁决扩/收窗，再报矩形**。
+//   顺序至关重要：reportRect 内部会 `if (expanded) return` 让路，
+//   所以必须让 syncExpand 先跑，才能在「面板刚开」的同一拍就把它挡掉。
+function sync() {
+  syncExpand()
+  reportRect()
 }
 
 function startRectLoop() {
   if (rectTimer) return
   // 200ms 足够跟上拖动/四边吸附；挂件本身的位置变化不会比这更快
-  rectTimer = setInterval(() => { reportRect(); syncExpand() }, 200)
-  window.addEventListener('resize', reportRect)
-  window.addEventListener('scroll', reportRect, true)
+  rectTimer = setInterval(sync, 200)
+  window.addEventListener('resize', sync)
+  window.addEventListener('scroll', sync, true)
   // 挂件被 SPA 摘掉又重挂、或切换角色/尺寸时也能及时更新
   try {
-    const mo = new MutationObserver(() => reportRect())
+    const mo = new MutationObserver(() => sync())
     mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] })
     // 面板开/关要立刻反映（不能等 200ms 轮询）：面板本身在 body 下、靠 class 切换显隐
-    const mo2 = new MutationObserver(() => { reportRect(); syncExpandThrottled() })
+    const mo2 = new MutationObserver(() => syncThrottled())
     mo2.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] })
   } catch (err) {}
-  setTimeout(reportRect, 120)
-  setTimeout(reportRect, 800)
+  // opacity 过渡（.dshwv-menu 的 .22s）结束时**不会有 MutationObserver 回调**，
+  // 所以再挂一个 transitionend 兜底：过渡一结束立刻重裁一次。
+  try {
+    document.addEventListener('transitionend', (e) => {
+      let t = e && e.target
+      if (!t || !t.classList) return
+      // 只关心我们选择器里的那几类
+      for (let i = 0; i < OVERLAY_CLASSES.length; i++) {
+        if (t.classList.contains(OVERLAY_CLASSES[i])) { syncThrottled(); return }
+      }
+    }, true)
+  } catch (err) {}
+  setTimeout(sync, 120)
+  setTimeout(sync, 800)
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +380,7 @@ ipcRenderer.on('dshw:input-mode', (e, m) => {
   lastKey = ''
   if (mode === 'hot') {
     startRectLoop()
-    reportRect()
+    sync()
   } else {
     if (rectTimer) { clearInterval(rectTimer); rectTimer = null }
     try { ipcRenderer.send('dshw:hot-rect', null) } catch (err) {}
