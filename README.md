@@ -1,6 +1,10 @@
-# dshw-desktop-overlay
+# dsh-whale-desktop-overlay
 
 **让已经装在 DSH 里的那只小鲸鱼，同时悬浮到 Windows 桌面上。**
+
+> 内部标识仍是 `dshw-desktop-overlay`（补丁标记 `// ==== dshw-desktop-overlay :: patch-X ====`、
+> 部署目录 `desktop-overlay.mjs` / `overlay-shell/`）。这是历史命名，不改 ——
+> 改了会让已经部署到本机的补丁无法按标记剥离。
 
 不改上游仓库、不重新实现挂件、不 fork 前端、不改 DSH 客户端 —— 前端那 1.7 万行一行都不动。
 
