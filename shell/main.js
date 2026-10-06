@@ -57,7 +57,7 @@ let hidden = false
 let healthFails = 0
 
 // 热点窗跟踪状态
-const hotState = { rect: null, bounds: null, drag: false, dragAt: 0, updates: 0, events: 0, injected: 0, focusedAfterDown: null, lastPageRect: null }
+const hotState = { rect: null, bounds: null, drag: false, dragAt: 0, updates: 0, events: 0, injected: 0, focusedAfterDown: null, lastPageRect: null, expanded: false, lastFullBleed: null }
 
 // —— 文件日志：Windows 上这是唯一可靠的输出通道 ——
 const RUN_DIR = path.join(RUNTIME_DIR, 'run')
@@ -334,10 +334,15 @@ function applyHotRect(rect) {
   }
   // 拖动期间冻结：热点窗跟着鲸鱼跑会让相对坐标恒定（鲸鱼原地追自己），拖动会失效
   if (hotState.drag) return
+  // 扩窗期间交给 applyHotExpand 全权处理，避免两边抢 setBounds 造成抖动
+  if (hotState.expanded) return
   let mb = null
   try { mb = win && !win.isDestroyed() ? win.getBounds() : null } catch (err) { mb = null }
   if (!mb) return
-  const pad = Math.max(0, Number(CFG.hotPadding ?? 14))
+  // 面板/遮罩铺满全屏时，rect 已经≈整个视口 —— 此时再加 padding 没有意义，
+  // 反而会被 clipToDisplay 裁回来造成 1~2px 的边缘抖动。只有「鲸鱼本体」才扩边。
+  const fullBleed = rect.w >= mb.width - 4 && rect.h >= mb.height - 4
+  const pad = fullBleed ? 0 : Math.max(0, Number(CFG.hotPadding ?? 14))
   const b = clipToDisplay(
     mb.x + rect.x - pad,
     mb.y + rect.y - pad,
@@ -351,10 +356,46 @@ function applyHotRect(rect) {
   }
   hotState.bounds = b
   hotState.updates++
-  if (hotState.updates <= 12) log('热点窗定位 ' + JSON.stringify(b) + ' ← 页面 ' + JSON.stringify({ x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h) }))
+  if (hotState.updates <= 12 || fullBleed !== hotState.lastFullBleed) {
+    log('热点窗定位 ' + JSON.stringify(b) + ' ← 页面 ' + JSON.stringify({ x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h) }) + (fullBleed ? ' [面板铺满]' : ''))
+  }
+  hotState.lastFullBleed = fullBleed
   try { hot.setBounds(b, false) } catch (err) { log('热点窗 setBounds 失败：' + String((err && err.message) || err)) }
   mark('hot-bounds')
   showHot()
+}
+
+// 抢先扩窗 / 收回。展开时热点窗铺满主窗，随后收到的真实鼠标一律落在窗内，
+// 面板弹出的第一下点击就不会丢。窗口仍是 focusable:false，主窗也仍是恒穿透，
+// 所以不会触发浏览器的遮挡检测（黑屏根因）——只是覆盖面积大了些。
+function applyHotExpand(on) {
+  if (inputMode !== 'hot') return
+  if (hotState.drag) return
+  if (!hot || hot.isDestroyed()) createHotWindow()
+  if (!hot || hot.isDestroyed()) return
+  let mb = null
+  try { mb = win && !win.isDestroyed() ? win.getBounds() : null } catch (err) { mb = null }
+  if (!mb) return
+
+  if (on) {
+    if (hotState.expanded) return
+    const before = hotState.bounds
+    hotState.expanded = true
+    const b = clipToDisplay(mb.x, mb.y, mb.width, mb.height)
+    hotState.bounds = b
+    hotState.updates++
+    log('热点窗扩为全屏（抢先接住面板点击） ' + JSON.stringify(b) + ' ← 原 ' + JSON.stringify(before))
+    try { hot.setBounds(b, false) } catch (err) { log('热点窗扩窗失败：' + String((err && err.message) || err)) }
+    mark('hot-expanded')
+    showHot()
+  } else {
+    if (!hotState.expanded) return
+    hotState.expanded = false
+    log('热点窗收回鲸鱼范围')
+    mark('hot-collapsed')
+    // 立刻按最后一次已知矩形贴合（没有就等下一次 reportRect）
+    applyHotRect(hotState.lastPageRect)
+  }
 }
 
 function showHot() {
@@ -591,6 +632,8 @@ function buildTray() {
 // ---------------------------------------------------------------------------
 ipcMain.on('dshw:set-ignore', (e, ignore) => { if (inputMode === 'window') setIgnoreLegacy(ignore) })
 ipcMain.on('dshw:hot-rect', (e, rect) => applyHotRect(rect))
+// 「抢先扩窗」：鼠标一动就把热点窗铺满视口，好让面板弹出后的第一下点击能被接住
+ipcMain.on('dshw:hot-expand', (e, on) => applyHotExpand(!!on))
 ipcMain.on('dshw:hot-input', (e, ev) => relayInput(ev))
 ipcMain.on('dshw:log', (e, msg) => log('[page] ' + String(msg).slice(0, 400)))
 ipcMain.on('dshw:quit', () => app.quit())

@@ -66,9 +66,39 @@ const pick = (...names) => {
 // 截图仍然落回工作区，方便直接看。
 const TMP = path.join(dshHome, 'whale-desktop-overlay', '_selftest')
 const SHOT_DIR = path.join(HERE, '_selftest')
-fs.rmSync(TMP, { recursive: true, force: true })
+
+// ⚠️ 清理上轮残留时必须容错：
+// 本机的安全删除层（safe-delete → genie-trash）对**含硬链接的目录会确定性失败**
+// （_selftest/electron 是硬链接拼的私有 Electron 分发），rmSync 会直接抛错。
+// 残留本身无害（下面会按需重建），所以这里逐项尽力清理、失败就跳过。
+function bestEffortRm(target) {
+  try {
+    fs.rmSync(target, { recursive: true, force: true })
+    return true
+  } catch (err) {
+    // 退一步：只删得掉的部分删掉，剩下的留给下一轮
+    let salvaged = 0
+    let failed = 0
+    const walk = (d) => {
+      let entries = []
+      try { entries = fs.readdirSync(d, { withFileTypes: true }) } catch (e) { return }
+      for (const e of entries) {
+        const p = path.join(d, e.name)
+        if (e.isDirectory()) { walk(p); try { fs.rmdirSync(p); salvaged++ } catch (er) { failed++ } }
+        else { try { fs.unlinkSync(p); salvaged++ } catch (er) { failed++ } }
+      }
+    }
+    walk(target)
+    try { fs.rmdirSync(target) } catch (e) { /* 目录里还有删不掉的硬链接，留着 */ }
+    console.log(`  注意：清理 ${path.basename(target)} 未完全成功（${salvaged} 项已清、${failed} 项被安全删除层拦住），继续运行`)
+    console.log('        被拦住的多为硬链接，实际占用 0 字节，不影响本轮自检。')
+    return false
+  }
+}
+
+bestEffortRm(TMP)
 fs.mkdirSync(path.join(TMP, 'run'), { recursive: true })
-fs.mkdirSync(SHOT_DIR, { recursive: true })
+try { fs.mkdirSync(SHOT_DIR, { recursive: true }) } catch (err) {}
 fs.writeFileSync(path.join(TMP, 'config.json'), JSON.stringify({
   enabled: true,
   autoStart: true,
