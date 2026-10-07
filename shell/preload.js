@@ -42,13 +42,24 @@ let mode = CFG.inputMode === 'window' ? 'window' : 'hot'
 //       一旦主进程错过/拒绝扩窗，本页 reportRect 永久让路 ⇒ 热点窗永久停摆，
 //       连鲸鱼都点不动（实测 hotUpdates 卡 1、hotEvents=0）。
 //
-// 现在这条：**几何即真相，单通路**。
-//   · 鲸鱼本体：只用 root 自己的**落点盒**（内联 style.left/top + offsetWidth/Height），
-//     不读过渡中的 getBoundingClientRect，从根上不抖。
+//  C) 「基座直接用 .dshwv-root 的整块」
+//     ⇒ 抖动治好了、面板也能点了，但**约七成面积是死区**。
+//       root 是 250×250 的**画布**（给气泡和 ☰ 留位置），鲸鱼图片只占它的 59.45%
+//       且贴右下角（.dshwv-img{right:0;bottom:0;width:59.45%;height:59.45%}）：
+//       线上实测热点窗 263×278 = 73,114px²，其中鲸鱼只有 149×149 = 22,201px²。
+//       而热点窗 `setIgnoreMouseEvents(false)` —— **从不忽略鼠标**，整块矩形都吃输入。
+//       于是那七成空区里：鼠标被吃掉、那里什么都没画、点击也**到不了下层窗口**
+//       ⇒ 表现就是「鲸鱼旁边的空白处点不动」（想点后面的浏览器/桌面点不到）。
+//
+// 现在这条：**几何即真相，单通路，并且贴着真正可交互的元素走**。
+//   · 鲸鱼本体：**图片自己的盒 ∩ 挂件写的凸包**（见 whaleBox）。几何全部走
+//     「相对 root 的落点盒」（见 relBoxOf），不读过渡中的 getBoundingClientRect，
+//     从根上不抖。
+//   · 气泡 / ☰：同在 root 子树里，可见时按落点盒并入（见 interactiveRect ②③）。
 //   · 弹出层：用**显式选择器清单**逐个量可见的（getBoundingClientRect 只用于
 //     判断可见性/取面板几何 —— 面板没有 left/top 过渡，读 rect 是安全的）。
 //     清单是穷举过的（见 OVERLAY_SEL 的实证说明），不会误纳常驻节点。
-//   · 两者求并集，一次上报。**不再有 expanded 让路**，也就没有停摆失败态。
+//   · 各源求并集，一次上报。**不再有 expanded 让路**，也就没有停摆失败态。
 // ---------------------------------------------------------------------------
 let lastKey = ''
 let rectTimer = null
@@ -134,7 +145,19 @@ const PANEL_SEL = [
   '.dshwv-menu', '.dshwv-usage-sub', '.dshwv-qedit',
   '.dshwv-colpop', '.dshwv-rgbmenu',
   '.dshwv-rolelist', '.dshwv-audiolist', '.dshwv-slotlist',
+  // 「?」说明圈 / 模板变量提示：同样是 dshwBodyAppend 挂到 body 的 position:fixed 浮层
+  // （CSS 默认 display:none，靠内联 display 开合，所以 computed 判定直接可用）。
+  // 它自己没内容可点，但**点它会关**（挂件在 document 上监听 pointerdown）——
+  // 不并进来的话，落在它上面的那次点击根本进不到页面，提示就关不掉了。
+  '.dshwv-tplhelp',
 ].join(',')
+
+// 气泡 / ☰ 都在 .dshwv-root **子树里**（.dshwv-root → .dshwv-body → 它们），
+// 所以几何走 relBoxOf() 的「相对 root 落点盒」，不走 body 挂载那条路。
+// 气泡是 width:100% 相对 root 的 —— 必须先验挂载点（insideRoot），
+// 否则万一哪天它改成直接挂 body，就变成"整个视口宽"，并集瞬间炸满屏。
+const BUBBLE_SEL = '.dshwv-pop'
+const MENU_BTN_SEL = '.dshwv-menu-btn'
 
 // 遮罩内部卡片（居中、小尺寸）—— 必须并入，否则遮罩打开后点不动卡片上的按钮。
 // 但它们的显隐只能由父遮罩决定，所以判定走 cardRect()（先查父遮罩是否激活）。
@@ -238,6 +261,120 @@ function rootBox(root) {
   return { left, top, right: left + w, bottom: top + h, width: w, height: h }
 }
 
+// 元素是否在 .dshwv-root 子树里。
+// 这是**挂载点校验**，专门防「宽高写的是百分比、参照物却是视口」这一类事故：
+// .dshwv-pop 是 width:100%（相对 root），一旦哪天改成直接挂 body，
+// 它就变成"整个视口宽"，并集会瞬间炸满屏。校验挂载点是最便宜的那道闸。
+function insideRoot(el, root) {
+  if (!el || !root) return false
+  let p = el
+  let d = 0
+  while (p && d < 40) {
+    if (p === root) return true
+    p = p.parentElement
+    d++
+  }
+  return false
+}
+
+// 元素相对 root 的**落点盒**（页面坐标）。
+// 做法：先量元素 rect 相对 root rect 的偏移 dx/dy，再把这组偏移套到 root 的
+// **落点盒**上。
+//   · root 做 left/top 过渡时，两个 rect 同步平移 ⇒ dx/dy 不受插值影响
+//   · 镜像（scaleX(-1)）由 rect 自己带出来，不必另判方向
+// 于是子树里的元素（鲸鱼图 / 气泡 / ☰）都能拿到不抖、且已经算上镜像的几何。
+// 返回值额外带 dx —— whaleBox 用它反推「有没有被镜像」。
+function relBoxOf(el, root, rb) {
+  if (!el || !root || !rb) return null
+  let er = null
+  let rr = null
+  try { er = el.getBoundingClientRect(); rr = root.getBoundingClientRect() } catch (err) { return null }
+  if (!er || !rr) return null
+  if (!(er.width > 0) || !(er.height > 0)) return null
+  const dx = er.left - rr.left
+  const dy = er.top - rr.top
+  const left = rb.left + dx
+  const top = rb.top + dy
+  return {
+    left, top, right: left + er.width, bottom: top + er.height,
+    width: er.width, height: er.height, dx,
+  }
+}
+
+// 从 .dshwv-img 的 clip-path 凸包里取出不透明区的包围盒**比例**（相对图片盒）。
+// 挂件 v757（issue #147）起会给图片写 `clip-path: polygon(x% y%, ...)` —— 那是它
+// 用命中图的**不透明像素凸包**算出来的（buildHitClipPath），也就是挂件自己认定
+// 「这里算鲸鱼」的边界。取它的包围盒 = 覆盖全部可点区域，且一个多余像素都不带。
+// 拿不到就返回 null（命中图加载失败 / 画布读回被抹白 → 挂件自己会 applyHitClip('')），
+// 由调用方退回图片矩形 —— 与挂件自己的 whaleRectHit() 回退分支语义一致。
+function hullFrac(img) {
+  let cp = ''
+  try { cp = (img.style && img.style.clipPath) || '' } catch (err) { cp = '' }
+  if (!cp) {
+    try { cp = String(getComputedStyle(img).clipPath || '') } catch (err) { cp = '' }
+  }
+  if (!cp || cp.indexOf('polygon(') < 0) return null
+  // 只认百分比。混进 px/calc 说明形态与预期不符 ⇒ 宁可不收窄
+  const toks = cp.match(/-?\d+(?:\.\d+)?%/g)
+  if (!toks || toks.length < 6 || toks.length % 2 !== 0) return null
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (let i = 0; i + 1 < toks.length; i += 2) {
+    const fx = parseFloat(toks[i]) / 100
+    const fy = parseFloat(toks[i + 1]) / 100
+    if (!isFinite(fx) || !isFinite(fy)) return null
+    if (fx < x0) x0 = fx
+    if (fx > x1) x1 = fx
+    if (fy < y0) y0 = fy
+    if (fy > y1) y1 = fy
+  }
+  // 凸包必须落在图片盒内，且不能退化成一条线（退化 = 读错了）
+  if (x0 < -0.01 || y0 < -0.01 || x1 > 1.01 || y1 > 1.01) return null
+  if (!(x1 - x0 > 0.2) || !(y1 - y0 > 0.2)) return null
+  return { x0, y0, x1, y1 }
+}
+
+// 鲸鱼本体的精确盒 = **图片自己的盒 ∩ 凸包包围盒**。
+// 返回 null 表示读不到图片（或图片不在 root 子树里），调用方退回 root 落点盒。
+function whaleBox(root, rb) {
+  if (!root || !rb) return null
+  let img = null
+  try { img = document.querySelector('.dshwv-img') } catch (err) { img = null }
+  if (!img || !img.isConnected || !insideRoot(img, root)) return null
+  const b = relBoxOf(img, root, rb)
+  if (!b) return null
+  // 镜像判定：图片右对齐 ⇒ dx ≈ root宽 - 图宽；被 scaleX(-1) 翻过 ⇒ dx ≈ 0。
+  // 取两者中点当分界。判错**只**影响「凸包往哪半边映射」，不影响图片盒本身，
+  // 所以万一判错，最坏是热点窗没收到最紧，绝不会跑到鲸鱼的反侧去。
+  const mirrored = b.dx < (rb.width - b.width) / 2
+  const h = hullFrac(img)
+  if (!h) return b
+  const x0 = mirrored ? 1 - h.x1 : h.x0
+  const x1 = mirrored ? 1 - h.x0 : h.x1
+  const left = b.left + x0 * b.width
+  const top = b.top + h.y0 * b.height
+  return {
+    left, top,
+    right: b.left + x1 * b.width,
+    bottom: b.top + h.y1 * b.height,
+    width: (x1 - x0) * b.width,
+    height: (h.y1 - h.y0) * b.height,
+  }
+}
+
+// 气泡是否被挂件打开。
+// 挂件用 bubbleBox.classList.add/remove('dshwv-pop-open')，是**类名**上的二值状态，
+// 没有过渡歧义（.dshwv-text 那条 opacity 过渡只影响文字淡入，不影响"开没开"）。
+function popOpen(el, root) {
+  if (!el || !el.isConnected) return false
+  if (!insideRoot(el, root)) return false
+  let cls = ''
+  try { cls = String(el.className || '') } catch (err) { cls = '' }
+  return /(^|\s)dshwv-pop-open(\s|$)/.test(cls)
+}
+
 function interactiveRect() {
   let root = null
   try { root = document.querySelector('.dshwv-root') } catch (err) { root = null }
@@ -252,17 +389,46 @@ function interactiveRect() {
     if (r.bottom > y2) y2 = r.bottom
   }
 
-  // ① 鲸鱼本体（落点盒）
-  add(rb)
+  // ① 鲸鱼本体 = 图片盒 ∩ 凸包（详见 whaleBox 的说明）。
+  //    读不到图片时退回 root 落点盒 —— 宁可热点窗大一点，也不能没有。
+  add(whaleBox(root, rb) || rb)
 
-  // ② 可见的面板/菜单
+  // ② 气泡（.dshwv-pop）
+  //    气泡**不是装饰**：开着的时候挂件把里面 svg 的 path/ellipse 设成
+  //    pointer-events:visiblePainted，并且靠"点它"来关掉（dismissWaitBubble，
+  //    v777 按用户反馈改成"可点关"）。所以开着就必须并入，
+  //    否则「点泡泡关掉」在热点窗模式下永远点不到。
+  //    它是 width:100% 相对 root 的（高 = 宽 × 700/1026），并进来时并集基本回到
+  //    root 整块 —— 与今天的行为一致，不产生回归；重要的是它**只在开着时**并。
+  let pops = []
+  try { pops = document.querySelectorAll(BUBBLE_SEL) } catch (err) { pops = [] }
+  for (let i = 0; i < pops.length; i++) {
+    if (!popOpen(pops[i], root)) continue
+    if (!visibleRectOf(pops[i])) continue
+    add(relBoxOf(pops[i], root, rb))
+  }
+
+  // ③ ☰ 菜单按钮
+  //    必须**显式**并入：凸包包围盒可能不含它。角色图不是正方形时（挂件自带的
+  //    DSH2.png 就是 2048×1024），图片按 object-fit:contain + object-position:right bottom
+  //    只画在盒子的下半，而 ☰ 在图片盒的中上部 ⇒ 正好落在凸包之外。
+  //    漏了它 = 菜单按钮点不动，比死区严重得多。
+  let btns = []
+  try { btns = document.querySelectorAll(MENU_BTN_SEL) } catch (err) { btns = [] }
+  for (let i = 0; i < btns.length; i++) {
+    if (!insideRoot(btns[i], root)) continue
+    if (!visibleRectOf(btns[i])) continue   // 淡入淡出(.15s) + dshwv-menu-btn-hidden 都靠它兜住
+    add(relBoxOf(btns[i], root, rb))
+  }
+
+  // ④ 可见的面板/菜单
   //    这一步是「面板点不动」的正解：面板几何必须直接进并集，
   //    不能指望别的通路抢先扩窗来覆盖它。
   let panels = []
   try { panels = document.querySelectorAll(PANEL_SEL) } catch (err) { panels = [] }
   for (let i = 0; i < panels.length; i++) add(popupRect(panels[i]))
 
-  // ③ 遮罩内部卡片（**不并遮罩本身**）
+  // ⑤ 遮罩内部卡片（**不并遮罩本身**）
   //    遮罩是 inset:0 铺满视口的 —— 把遮罩并进来等于把热点窗撑满全屏，
   //    那正是 old expanded 老路的坑（全屏窗口 + 输入/focus 一堆副作用），不要。
   //    用户真正要点的是**遮罩里的卡片**（居中小尺寸），所以只并卡片。
