@@ -321,6 +321,27 @@ function clipToDisplay(x, y, w, h) {
   return { x: Math.round(x1), y: Math.round(y1), width: Math.round(x2 - x1), height: Math.round(y2 - y1) }
 }
 
+// 热点窗重新定位的判定阈值（px）。
+//
+// 背景：挂件 .dshwv-root 带 `transition:left .16s, top .16s, transform .3s`，
+// 在其位置/尺寸过渡期间 getBoundingClientRect() 返回**非整数插值**，
+// 相邻 200ms 采样点能差 1~7px（实测日志里 h 在 147~156 之间跳）。
+// 初始版只比较「是否完全相等」，于是每个采样点都判定为"变了" → 每 200ms 调一次
+// setBounds 挪窗口。**在光标底下反复挪窗口**会让系统不断给热点窗发进入/离开事件，
+// 页面因此反复清掉又重建 hover 态，用户看到光标在 箭头 ⇄ 手型 之间来回跳。
+//
+// 解法：把「上一次真正应用的窗口矩形」当**锚点**，只有真实变化才重新定位。
+//   位置变化 > POS_EPS  → 认为是真的移动了（拖鲸鱼、四边吸附）
+//   尺寸变化 > SIZE_EPS → 认为并集真的变了（开/关菜单、切换角色/缩放）
+// 两个都没超就**一动不动**，从根上消除抖动。
+//
+// 阈值取值依据：实测过渡抖动 ≤7px，所以取 10px 就能安全覆盖；
+// 而真实变化幅度是几百 px（菜单开合）或至少几十 px（拖动/换角色），
+// 中间空档极大，10px 落在里面不会误伤。
+// 热点窗另带 hotPadding(14px) 余量，小幅漂移本身就被兜住，不会露出鲸鱼。
+const HOT_POS_EPS = 10
+const HOT_SIZE_EPS = 10
+
 function applyHotRect(rect) {
   hotState.lastPageRect = rect
   if (inputMode !== 'hot') return
@@ -345,9 +366,14 @@ function applyHotRect(rect) {
     rect.h + pad * 2,
   )
   const prev = hotState.bounds
-  if (prev && prev.x === b.x && prev.y === b.y && prev.width === b.width && prev.height === b.height) {
-    if (!hotShown) showHot()
-    return
+  if (prev) {
+    // 位置与尺寸分别判阈值；都没超 → 窗口保持不动（这是消除光标抖动的关键）
+    const posSame = Math.abs(b.x - prev.x) <= HOT_POS_EPS && Math.abs(b.y - prev.y) <= HOT_POS_EPS
+    const sizeSame = Math.abs(b.width - prev.width) <= HOT_SIZE_EPS && Math.abs(b.height - prev.height) <= HOT_SIZE_EPS
+    if (posSame && sizeSame) {
+      if (!hotShown) showHot()
+      return
+    }
   }
   hotState.bounds = b
   hotState.updates++
