@@ -222,6 +222,13 @@ function createWindow() {
   win.webContents.on('console-message', relay('renderer'))
   win.webContents.on('did-finish-load', () => {
     mark('loaded')
+    // 首次加载完成后可能立刻重载一次（见 scheduleStartupReload 的说明）
+    if (startupReloadDone) {
+      // 这是重载后的第二次加载 —— 正常路径
+      mark('reloaded')
+    } else {
+      scheduleStartupReload()
+    }
     sendInputMode()
   })
   win.webContents.on('did-fail-load', (e, code, desc, url) => { log(`did-fail-load ${code} ${desc} ${url}`); mark('load-failed', { loadError: `${code} ${desc}` }) })
@@ -245,6 +252,52 @@ function createWindow() {
 
 function sendInputMode() {
   try { if (win && !win.isDestroyed()) win.webContents.send('dshw:input-mode', inputMode) } catch (err) {}
+}
+
+// ---------------------------------------------------------------------------
+// 启动后自动重载一次挂件
+// ---------------------------------------------------------------------------
+// 背景（实测）：**首次**加载时，并集会出现一次「全视口」的瞬时误判，
+// 之后再也不会。手动「重新加载挂件」一次即可恢复正常 —— 这也是用户一直以来
+// 的操作。与其继续追那个只在首启窗口期出现的时序问题，不如把这个已确认有效的
+// 操作自动化：首启完成后延时重载一次，把那次抖动直接跳过。
+//
+// 为什么首启会有、重载后没有：
+//   挂件初始化是一大串 DOM 创建（900KB 脚本 + 几十个 body 节点）。
+//   首次执行时，某些节点处于「已创建、CSS 规则已生效、但内联样式尚未写入」
+//   的中间态（例如遮罩的 CSS 默认 display:flex、内联 none 还没设），
+//   preload 的 200ms 采样正好落在这个窗口里就会读到异常几何。
+//   重载后挂件重建很快、DOM 生命周期更紧凑，采样不再命中该窗口。
+//
+// 设计约束：
+//   · **只重载一次**（startupReloadDone 保证），绝不能循环
+//   · 延时 1500ms：足够让首启那一串初始化跑完，又短到用户几乎无感
+//     （重载前的那一瞬间用户还没开始操作）
+//   · 走 webContents.reload()，与托盘「重新加载挂件」完全同一条路径 ——
+//     即用户手动做、且已验证有效的那个操作
+//   · 用 config 开关 autoReloadOnStart 可关（默认开）
+//   · 重载会重建渲染进程，所以要顺带复位热点窗的几何缓存，
+//     等新页面重新上报（否则热点窗会短暂停在旧位置）
+let startupReloadDone = false
+let startupReloadTimer = null
+
+function scheduleStartupReload() {
+  if (startupReloadDone) return
+  if (CFG.autoReloadOnStart === false) { log('已禁用启动自动重载（autoReloadOnStart=false）'); return }
+  startupReloadDone = true
+  const delay = Math.max(0, Number(CFG.autoReloadDelayMs ?? 1500))
+  if (startupReloadTimer) { clearTimeout(startupReloadTimer); startupReloadTimer = null }
+  startupReloadTimer = setTimeout(() => {
+    startupReloadTimer = null
+    if (!win || win.isDestroyed()) return
+    log(`启动自动重载挂件（延时 ${delay}ms）—— 跳过首启窗口期的那次抖动`)
+    mark('auto-reload')
+    // 复位热点窗几何缓存：新页面会重新上报，重新贴合即可
+    hotState.lastPageRect = null
+    hotState.bounds = null
+    try { hot.webContents.sendInputEvent({ type: 'mouseLeave', x: 0, y: 0 }) } catch (err) {}
+    try { win.webContents.reload() } catch (err) { log('自动重载失败：' + String((err && err.message) || err)) }
+  }, delay)
 }
 
 // ---------------------------------------------------------------------------
