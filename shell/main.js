@@ -271,7 +271,9 @@ function sendInputMode() {
 //
 // 设计约束：
 //   · **只重载一次**（startupReloadDone 保证），绝不能循环
-//   · 延时 1500ms：足够让首启那一串初始化跑完，又短到用户几乎无感
+//   · 延时 300ms：用户反馈 1500ms 太长，能看出挂件「闪一下」。
+//     时机由 did-finish-load 兜底（页面已 load 完），300ms 时仍在跑的初始化
+//     会被直接中断重建 —— 比等它跑完再重载更干净
 //     （重载前的那一瞬间用户还没开始操作）
 //   · 走 webContents.reload()，与托盘「重新加载挂件」完全同一条路径 ——
 //     即用户手动做、且已验证有效的那个操作
@@ -285,7 +287,7 @@ function scheduleStartupReload() {
   if (startupReloadDone) return
   if (CFG.autoReloadOnStart === false) { log('已禁用启动自动重载（autoReloadOnStart=false）'); return }
   startupReloadDone = true
-  const delay = Math.max(0, Number(CFG.autoReloadDelayMs ?? 1500))
+  const delay = Math.max(0, Number(CFG.autoReloadDelayMs ?? 300))
   if (startupReloadTimer) { clearTimeout(startupReloadTimer); startupReloadTimer = null }
   startupReloadTimer = setTimeout(() => {
     startupReloadTimer = null

@@ -63,8 +63,11 @@ const DEFAULT_CONFIG = {
   // 重载后 DOM 生命周期更紧凑就复现不了。与其追时序，不如把「用户手动重载」
   // 这个已验证有效的操作自动化。置 false 可关掉。
   autoReloadOnStart: true,
-  // 自动重载的延时（ms）。太短会重载到还没初始化完的页面，太长用户会看到抖动。
-  autoReloadDelayMs: 1500,
+  // 自动重载的延时（ms）。
+  // 1500ms 实测太长 —— 用户能看出挂件「闪一下」，所以压到 300ms。
+  // 重载时机由 did-finish-load 保证（页面已 load 完），300ms 时仍在跑的
+  // 初始化会被直接中断重建，比等它跑完再重载更干净。
+  autoReloadDelayMs: 300,
   // 是否关掉 DSH 页面里的那只鲸鱼（注入通道由补丁 D/E 短路）。
   // 悬浮窗已经在桌面独立显示时，页内那只就成了重复的第二只 → 默认关掉。
   hideInAppWidget: true,

@@ -62,6 +62,8 @@ node selftest.mjs
 | `clickThrough` | `true` | 空白处穿透 |
 | `inputMode` | `'hot'` | `'hot'` = 小热点窗转发真实鼠标（推荐）；`'window'` = 整窗命中测试 |
 | `hotPadding` | `14` | 热点窗相对鲸鱼包围盒外扩的像素（留余量给气泡 / 菜单） |
+| `autoReloadOnStart` | `true` | 首启后自动「重新加载挂件」一次。挂件的首次初始化会与采样撞车产生一次抖动，重载可跳过它 |
+| `autoReloadDelayMs` | `300` | 上面那次自动重载的延时（ms）。太长能看到挂件「闪一下」 |
 | `hideInAppWidget` | `true` | `true` = 关掉 DSH 页面里那只鲸鱼，桌面只留一只 |
 | `quitWhenHostExits` | `true` | 宿主退出时自动关窗，不留孤儿 |
 | `tray` | `true` | 托盘图标 |
