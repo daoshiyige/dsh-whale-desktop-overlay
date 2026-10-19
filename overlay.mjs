@@ -696,6 +696,10 @@ export async function startWhaleDesktopOverlay(opts) {
     const table = st.routeMap || routeMap
     const route = table.get(pathname)
     if (route) {
+      // 打标记：告诉插件"这次请求来自桌面悬浮层自己"。
+      // 插件的 /dsh-whale/widget.js 会用 hideInAppWidget 拦「DSH 页内那只」，
+      // 必须放行我这个源，否则桌面这只鲸鱼会跟着一起没了（patch-F 读这个头）。
+      try { req.headers['x-dshw-overlay'] = '1' } catch (err) {}
       // 让 handler 看到的 Host 是我们自己（回环），url 保持原样（含 query）
       try {
         const out = route.handler(req, res)

@@ -73,18 +73,32 @@ const runtimeDir = path.join(dshHome, 'whale-desktop-overlay')
 const M = (n, side) => `// ==== dshw-desktop-overlay :: patch-${n} ${side} ====`
 
 const PATCH_A = `${M('A', 'begin')}
-// 桌面悬浮补丁（由 dshw-desktop-overlay/install.mjs 注入）。本段不含逻辑，只为 patch-B/C/D/E 备好作用域。
+// 桌面悬浮补丁（由 dshw-desktop-overlay/install.mjs 注入）。本段不含逻辑，只为 patch-B/C/D/E/F 备好作用域。
 // 卸载与重新打补丁都靠这组标记定位 —— 请勿改动标记文本。
 const __dshwOverlayState = { routes: [] }
 // 运行时数据（config.json / run 日志）刻意放在 $DSH_HOME 下，插件被更新覆盖也不会丢。
 const __dshwOverlayRuntimeDir = path.join(DSH_HOME, 'whale-desktop-overlay')
-// 页内挂件开关：桌面悬浮窗已经能独立显示时，DSH 页面里那只就是重复的第二只（patch-D/E 用它短路注入）。
-// 每次注入前重读 config.json —— 改完配置刷新一下 DSH 页面即可，不用重启。
+// 页内挂件开关：桌面悬浮窗已经能独立显示时，DSH 页面里那只就是重复的第二只。
+// **判定点只有一处**：/dsh-whale/widget.js 路由（patch-F）。
+// （早期版本在"往注入表推不推这一行"那里判 —— 那层是宿主**启动时一次性收集**的，
+//  等于只在启动那一刻生效，之后改配置必须重启 DSH，用户实测"勾了没反应"。）
 function __dshwInAppWidgetDisabled() {
   try {
     const c = JSON.parse(fs.readFileSync(path.join(__dshwOverlayRuntimeDir, 'config.json'), 'utf8'))
     return !!(c && c.hideInAppWidget === true)
   } catch (err) { return false }
+}
+// 这次请求是不是**桌面悬浮层自己**发的？
+// 悬浮层跑的是 overlay.mjs 起的独立 HTTP 服务，分发到插件路由前会打上 x-dshw-overlay 头
+// （见 overlay.mjs 的 server 分发处）。用它来把"桌面那只"和"DSH 页内那只"精确分开，
+// 不靠 Referer 之类的推测。
+// 拿不到 req/headers 时**按悬浮层处理**（返回 true）：宁可少拦一次，也绝不能把桌面那只弄没。
+function __dshwIsOverlayRequest(req) {
+  try {
+    const h = req && req.headers
+    if (!h) return true
+    return String(h['x-dshw-overlay'] || '') === '1'
+  } catch (err) { return true }
 }
 ${M('A', 'end')}
 `
@@ -122,9 +136,13 @@ const PATCH_C = `    ${M('C', 'begin')}
 `
 
 const PATCH_D = `        ${M('D', 'begin')}
-        // 页内挂件开关：hideInAppWidget=true 时不往宿主注入表里推那一行 →
-        // DSH 页面里不再出现第二只鲸鱼（桌面悬浮窗照常工作，路由完全不受影响）。
-        if (__dshwInAppWidgetDisabled()) return
+        // ⚠️ 页内挂件开关**不再在这里判**。
+        // 这一层是"往宿主的页面注入表里推不推这一行"，而桌面壳的注入表是
+        // **宿主启动时一次性收集**的（dsh-desktop-host: collectIndexInjections）——
+        // 在这里判，等于只在启动那一刻生效：之后无论怎么勾、怎么刷新页面都不会变，
+        // 只能重启 DSH。用户实测就是"勾了「页内也显示」但页面上没出现"。
+        // 现在**永远把这一行推进表**，真正的开关交给 /dsh-whale/widget.js 路由
+        // 按请求判（那条路由本来是 no-store，每次加载都会重新请求）—— 见 patch-F。
         ${M('D', 'end')}
 `
 
@@ -145,6 +163,29 @@ const ANCHOR_D = `        if (!Array.isArray(table)) return`
 // ② tapIndex（web 端通道）
 const ANCHOR_E = `      if (html.indexOf('/dsh-whale/widget.js') !== -1) return html`
 
+const PATCH_F = `        ${M('F', 'begin')}
+        // ── 页内挂件开关的**唯一判定点** ────────────────────────────────────
+        // 为什么判在这里：这条路由带 Cache-Control: no-store，页面每次加载都会重新请求
+        // ⇒「勾选/取消 → 刷新 DSH 页面」立刻生效，不用重启 DSH。
+        // （判在注入表那里不行，见 patch-D 的说明：那是启动时一次性收集的。）
+        // 为什么必须放行 x-dshw-overlay 请求：桌面悬浮层是 overlay.mjs 起的**独立服务**，
+        // 它的首页也就是一张只引这个脚本的透明页。这里若不加区分地拦，
+        // 桌面那只鲸鱼会跟着一起消失。
+        if (__dshwInAppWidgetDisabled() && !__dshwIsOverlayRequest(req)) {
+          res.writeHead(200, {
+            'Content-Type': 'application/javascript; charset=utf-8',
+            'Cache-Control': 'no-store',
+          })
+          res.end('/* dshw-desktop-overlay: 页内挂件已关闭（config.json 里 hideInAppWidget=true） */\\n')
+          return
+        }
+        ${M('F', 'end')}
+`
+// /dsh-whale/widget.js 路由的 handler 头
+const ANCHOR_F = `      path: '/dsh-whale/widget.js',
+      handler: (req, res) => {
+`
+
 // ---------------------------------------------------------------------------
 // 补丁外科手术
 // ---------------------------------------------------------------------------
@@ -153,8 +194,8 @@ function stripBlocks(text) {
   const out = []
   let depth = 0
   for (const line of lines) {
-    const isBegin = /^\/\/ ==== dshw-desktop-overlay :: patch-[A-E] begin ====$/.test(line.trim())
-    const isEnd = /^\/\/ ==== dshw-desktop-overlay :: patch-[A-E] end ====$/.test(line.trim())
+    const isBegin = /^\/\/ ==== dshw-desktop-overlay :: patch-[A-F] begin ====$/.test(line.trim())
+    const isEnd = /^\/\/ ==== dshw-desktop-overlay :: patch-[A-F] end ====$/.test(line.trim())
     if (isBegin) { depth++; continue }
     if (isEnd) { if (depth > 0) depth--; continue }
     if (depth > 0) continue
@@ -164,7 +205,7 @@ function stripBlocks(text) {
 }
 
 function hasBlocks(text) {
-  return ['A', 'B', 'C', 'D', 'E'].every((n) => text.includes(M(n, 'begin')))
+  return ['A', 'B', 'C', 'D', 'E', 'F'].every((n) => text.includes(M(n, 'begin')))
 }
 
 function applyPatch(text) {
@@ -174,12 +215,14 @@ function applyPatch(text) {
   if (!clean.includes(ANCHOR_C)) throw new Error('找不到插入锚点 C：root.inject 结束行')
   if (!clean.includes(ANCHOR_D)) throw new Error('找不到插入锚点 D：webserver/index-inject 处理器')
   if (!clean.includes(ANCHOR_E)) throw new Error('找不到插入锚点 E：tapIndex 注入回调')
+  if (!clean.includes(ANCHOR_F)) throw new Error('找不到插入锚点 F：/dsh-whale/widget.js 路由')
 
   let out = clean.replace(ANCHOR_A, PATCH_A + ANCHOR_A)
   out = out.replace(ANCHOR_B, ANCHOR_B + PATCH_B)
   out = out.replace(ANCHOR_C, PATCH_C + ANCHOR_C)
   out = out.replace(ANCHOR_D, ANCHOR_D + '\n' + PATCH_D)
   out = out.replace(ANCHOR_E, PATCH_E + ANCHOR_E)
+  out = out.replace(ANCHOR_F, ANCHOR_F + PATCH_F)
   return out
 }
 
