@@ -257,7 +257,7 @@ function status() {
   try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) } catch (err) { cfg = {} }
   console.log('插件目录   :', pluginDir)
   console.log('DSH_HOME  :', dshHome)
-  console.log('index.js  :', patched ? '已打补丁 A–E ✓' : '未打补丁 ✗')
+  console.log('index.js  :', patched ? '已打补丁 A–F ✓' : '未打补丁 ✗')
   console.log('运行时文件 :', `overlay=${dep.loader ? '✓' : '✗'} shell=${dep.shell ? '✓' : '✗'} preload=${dep.preload ? '✓' : '✗'} hot=${dep.hot ? '✓' : '✗'} hotPreload=${dep.hotPreload ? '✓' : '✗'}`)
   console.log('配置目录   :', runtimeDir, fs.existsSync(cfgPath) ? '(有 config.json)' : '(未创建)')
   console.log('交互方式   :', cfg.inputMode === 'window' ? 'window（旧：压住鲸鱼可能让视频黑屏）' : 'hot（小热点窗，低干扰）')

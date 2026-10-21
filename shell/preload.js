@@ -139,6 +139,9 @@ function elVisible(el) {
 const MASK_SEL = [
   '.dshwv-cropmask', '.dshwv-gifmask', '.dshwv-resmask', '.dshwv-audiomask',
   '.dshwv-bubmask', '.dshwv-snapmask', '.dshwv-confirmmask', '.dshwv-usage-mask',
+  // 0.4.x（v823）新增：泡泡框编辑器。inset:0 + display:flex，与其他遮罩同一套骨架。
+  // 漏了它 ⇒ 打开「泡泡框」编辑器后热点窗盖不到卡片，整个编辑器点不动。
+  '.dshwv-framemask',
 ].join(',')
 
 const PANEL_SEL = [
@@ -164,6 +167,8 @@ const MENU_BTN_SEL = '.dshwv-menu-btn'
 const CARD_SEL = [
   '.dshwv-cropwin', '.dshwv-gifwin', '.dshwv-audiowin', '.dshwv-confirmwin',
   '.dshwv-snapwin', '.dshwv-bubcard', '.dshwv-usage-card',
+  // 0.4.x（v823）新增：泡泡框编辑器卡片（560px / max-height:92vh）
+  '.dshwv-framecard',
 ].join(',')
 
 const OVERLAY_SEL = MASK_SEL + ',' + PANEL_SEL + ',' + CARD_SEL

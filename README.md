@@ -35,6 +35,13 @@ node install.mjs --uninstall  # 还原（按标记剥离补丁 + 删掉部署的
 
 装完**重启 DeepSeek Harness** —— 悬浮层只在插件加载时挂载。
 
+> ⚠️ **每次 `dsh plugin update dsh-whale-widget` 之后都要重跑一次 `node install.mjs`。**
+> 插件更新会覆盖整个包目录（含 `lib/index.js` 里的补丁和部署进去的 `overlay-shell/`），
+> 悬浮层会**完全消失**（不是点不动）。重跑即可恢复，幂等。
+> 更新后建议顺手跑 `node _selftest/rect-union-test.js`：场景 18 会把挂件源码里
+> 实际创建的遮罩跟我们的选择器清单对表，新版若新增对话框会直接报"缺 dshwv-xxxmask"。
+> 详见 [`docs/修复说明-插件升级后恢复.md`](docs/修复说明-插件升级后恢复.md)。
+
 不想重启就验证渲染：
 
 ```bash
